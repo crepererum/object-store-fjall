@@ -115,14 +115,15 @@ impl ObjectStore for FjallStore {
             loop {
                 let mut tx = keyspace.write_tx().generic_err()?;
 
-                let existed = tx
+                let existing = tx
                     .fetch_update(&partition, head_key.clone(), |_| {
                         Some(head_encoded.clone().into())
                     })
-                    .generic_err()?
-                    .is_some();
+                    .generic_err()?;
 
-                if existed {
+                if let Some(head) = existing {
+                    let head = Head::from_slice(&head)?;
+                    let data_key_prefix = crate::data_key_prefix(head.id);
                     clear_data(&mut tx, &partition, data_key_prefix.clone())?;
                 }
 
@@ -409,15 +410,16 @@ impl ObjectStore for FjallStore {
                 let data_key_prefix_to = data_key_prefix(head_to.id);
                 let head_to_encoded = head_to.to_slice()?;
 
-                let existed = tx
+                let existing = tx
                     .fetch_update(&partition, head_key_to.clone(), |_| {
                         Some(head_to_encoded.clone().into())
                     })
-                    .generic_err()?
-                    .is_some();
+                    .generic_err()?;
 
-                if existed {
-                    clear_data(&mut tx, &partition, data_key_prefix_to.clone())?;
+                if let Some(head) = existing {
+                    let head = Head::from_slice(&head)?;
+                    let data_key_prefix = crate::data_key_prefix(head.id);
+                    clear_data(&mut tx, &partition, data_key_prefix)?;
                 }
 
                 let to_copy = tx
@@ -427,6 +429,58 @@ impl ObjectStore for FjallStore {
                 for (idx, data) in to_copy.into_iter().enumerate() {
                     let data_key = data_key(data_key_prefix_to.clone(), idx);
                     tx.insert(&partition, data_key, data.clone());
+                }
+
+                match tx.commit().generic_err()? {
+                    Ok(()) => break,
+                    Err(_) => {
+                        // conflict, retry
+                    }
+                }
+            }
+
+            keyspace
+                .persist(fjall::PersistMode::SyncAll)
+                .generic_err()?;
+
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let handles = Arc::clone(&self.handles);
+        let head_key_from = head_key(from);
+        let head_key_to = head_key(to);
+        let from = from.clone();
+
+        spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partition,
+            } = handles.as_ref();
+
+            loop {
+                let mut tx = keyspace.write_tx().generic_err()?;
+
+                let Some(head) = tx
+                    .fetch_update(&partition, head_key_from.clone(), |_| None)
+                    .generic_err()?
+                else {
+                    return Err(Error::NotFound {
+                        path: from.to_string(),
+                        source: "not found".to_owned().into(),
+                    });
+                };
+
+                let existing = tx
+                    .fetch_update(&partition, head_key_to.clone(), |_| Some(head.clone()))
+                    .generic_err()?;
+
+                if let Some(head) = existing {
+                    let head = Head::from_slice(&head)?;
+                    let data_key_prefix = crate::data_key_prefix(head.id);
+                    clear_data(&mut tx, &partition, data_key_prefix)?;
                 }
 
                 match tx.commit().generic_err()? {
@@ -659,5 +713,13 @@ mod integration_tests {
         let storage = FjallStore::open(path.path()).await.unwrap();
 
         object_store::integration::put_get_delete_list(&storage).await;
+    }
+
+    #[tokio::test]
+    async fn rename_and_copy() {
+        let path = tempfile::tempdir().unwrap();
+        let storage = FjallStore::open(path.path()).await.unwrap();
+
+        object_store::integration::rename_and_copy(&storage).await;
     }
 }
