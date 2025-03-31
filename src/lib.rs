@@ -26,6 +26,53 @@ struct Handles {
     partition: TransactionalPartitionHandle,
 }
 
+impl Handles {
+    async fn write_transaction<F>(self: &Arc<Self>, f: F) -> Result<()>
+    where
+        F: for<'a> Fn(&'a mut WriteTransaction, &'a TransactionalPartitionHandle) -> Result<()>
+            + Send
+            + 'static,
+    {
+        let mut f = f;
+
+        loop {
+            let this = Arc::clone(self);
+
+            let (done, f_back) = spawn_blocking(move || {
+                let Self {
+                    keyspace,
+                    partition,
+                } = this.as_ref();
+
+                let mut tx = keyspace.write_tx().generic_err()?;
+
+                f(&mut tx, partition)?;
+
+                match tx.commit().generic_err()? {
+                    Ok(()) => {
+                        keyspace
+                            .persist(fjall::PersistMode::SyncAll)
+                            .generic_err()?;
+
+                        Result::<_, Error>::Ok((true, f))
+                    }
+                    Err(_) => {
+                        // conflict, retry
+                        Ok((false, f))
+                    }
+                }
+            })
+            .await??;
+
+            f = f_back;
+
+            if done {
+                return Ok(());
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for Handles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handles").finish_non_exhaustive()
@@ -101,29 +148,20 @@ impl ObjectStore for FjallStore {
             size: payload.content_length() as u64,
             id,
         };
+        let head_encoded = head.to_slice()?;
         let data_key_prefix = data_key_prefix(head.id);
-        let handles = Arc::clone(&self.handles);
 
-        spawn_blocking(move || {
-            let Handles {
-                keyspace,
-                partition,
-            } = handles.as_ref();
-
-            let head_encoded = head.to_slice()?;
-
-            loop {
-                let mut tx = keyspace.write_tx().generic_err()?;
-
+        self.handles
+            .write_transaction(move |tx, partition| {
                 let existing = tx
-                    .fetch_update(&partition, head_key.clone(), |_| {
+                    .fetch_update(partition, head_key.clone(), |_| {
                         Some(head_encoded.clone().into())
                     })
                     .generic_err()?;
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    clear_data(&mut tx, &partition, head.id)?;
+                    clear_data(tx, partition, head.id)?;
                 }
 
                 for (idx, data) in payload.iter().enumerate() {
@@ -132,24 +170,12 @@ impl ObjectStore for FjallStore {
                     }
 
                     let data_key = data_key(data_key_prefix.clone(), idx);
-                    tx.insert(&partition, data_key, data.clone());
+                    tx.insert(partition, data_key, data.clone());
                 }
 
-                match tx.commit().generic_err()? {
-                    Ok(()) => break,
-                    Err(_) => {
-                        // conflict, retry
-                    }
-                }
-            }
-
-            keyspace
-                .persist(fjall::PersistMode::SyncAll)
-                .generic_err()?;
-
-            Result::<_, Error>::Ok(())
-        })
-        .await??;
+                Ok(())
+            })
+            .await?;
 
         let id = id.to_string();
 
@@ -255,41 +281,21 @@ impl ObjectStore for FjallStore {
 
     async fn delete(&self, location: &Path) -> Result<()> {
         let head_key = head_key(location);
-        let handles = Arc::clone(&self.handles);
 
-        spawn_blocking(move || {
-            let Handles {
-                keyspace,
-                partition,
-            } = handles.as_ref();
-
-            loop {
-                let mut tx = keyspace.write_tx().generic_err()?;
-
+        self.handles
+            .write_transaction(move |tx, partition| {
                 let existing = tx
-                    .fetch_update(&partition, head_key.clone(), |_| None)
+                    .fetch_update(partition, head_key.clone(), |_| None)
                     .generic_err()?;
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    clear_data(&mut tx, &partition, head.id)?;
+                    clear_data(tx, partition, head.id)?;
                 }
 
-                match tx.commit().generic_err()? {
-                    Ok(()) => break,
-                    Err(_) => {
-                        // conflict, retry
-                    }
-                }
-            }
-
-            keyspace
-                .persist(fjall::PersistMode::SyncAll)
-                .generic_err()?;
-
-            Result::<_, Error>::Ok(())
-        })
-        .await?
+                Ok(())
+            })
+            .await
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -377,21 +383,13 @@ impl ObjectStore for FjallStore {
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        let handles = Arc::clone(&self.handles);
         let head_key_from = head_key(from);
         let head_key_to = head_key(to);
         let from = from.clone();
 
-        spawn_blocking(move || {
-            let Handles {
-                keyspace,
-                partition,
-            } = handles.as_ref();
-
-            loop {
-                let mut tx = keyspace.write_tx().generic_err()?;
-
-                let Some(head_from) = tx.get(&partition, head_key_from.clone()).generic_err()?
+        self.handles
+            .write_transaction(move |tx, partition| {
+                let Some(head_from) = tx.get(partition, head_key_from.clone()).generic_err()?
                 else {
                     return Err(Error::NotFound {
                         path: from.to_string(),
@@ -407,52 +405,32 @@ impl ObjectStore for FjallStore {
                 let head_to_encoded = head_to.to_slice()?;
 
                 let existing = tx
-                    .fetch_update(&partition, head_key_to.clone(), |_| {
+                    .fetch_update(partition, head_key_to.clone(), |_| {
                         Some(head_to_encoded.clone().into())
                     })
                     .generic_err()?;
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    clear_data(&mut tx, &partition, head.id)?;
+                    clear_data(tx, partition, head.id)?;
                 }
 
-                copy_data(&mut tx, partition, head_from.id, head_to.id)?;
+                copy_data(tx, partition, head_from.id, head_to.id)?;
 
-                match tx.commit().generic_err()? {
-                    Ok(()) => break,
-                    Err(_) => {
-                        // conflict, retry
-                    }
-                }
-            }
-
-            keyspace
-                .persist(fjall::PersistMode::SyncAll)
-                .generic_err()?;
-
-            Ok(())
-        })
-        .await?
+                Ok(())
+            })
+            .await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        let handles = Arc::clone(&self.handles);
         let head_key_from = head_key(from);
         let head_key_to = head_key(to);
         let from = from.clone();
 
-        spawn_blocking(move || {
-            let Handles {
-                keyspace,
-                partition,
-            } = handles.as_ref();
-
-            loop {
-                let mut tx = keyspace.write_tx().generic_err()?;
-
+        self.handles
+            .write_transaction(move |tx, partition| {
                 let Some(head) = tx
-                    .fetch_update(&partition, head_key_from.clone(), |_| None)
+                    .fetch_update(partition, head_key_from.clone(), |_| None)
                     .generic_err()?
                 else {
                     return Err(Error::NotFound {
@@ -462,48 +440,28 @@ impl ObjectStore for FjallStore {
                 };
 
                 let existing = tx
-                    .fetch_update(&partition, head_key_to.clone(), |_| Some(head.clone()))
+                    .fetch_update(partition, head_key_to.clone(), |_| Some(head.clone()))
                     .generic_err()?;
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    clear_data(&mut tx, &partition, head.id)?;
+                    clear_data(tx, partition, head.id)?;
                 }
 
-                match tx.commit().generic_err()? {
-                    Ok(()) => break,
-                    Err(_) => {
-                        // conflict, retry
-                    }
-                }
-            }
-
-            keyspace
-                .persist(fjall::PersistMode::SyncAll)
-                .generic_err()?;
-
-            Ok(())
-        })
-        .await?
+                Ok(())
+            })
+            .await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let handles = Arc::clone(&self.handles);
         let head_key_from = head_key(from);
         let head_key_to = head_key(to);
         let from = from.clone();
         let to = to.clone();
 
-        spawn_blocking(move || {
-            let Handles {
-                keyspace,
-                partition,
-            } = handles.as_ref();
-
-            loop {
-                let mut tx = keyspace.write_tx().generic_err()?;
-
-                let Some(head_from) = tx.get(&partition, head_key_from.clone()).generic_err()?
+        self.handles
+            .write_transaction(move |tx, partition| {
+                let Some(head_from) = tx.get(partition, head_key_from.clone()).generic_err()?
                 else {
                     return Err(Error::NotFound {
                         path: from.to_string(),
@@ -519,7 +477,7 @@ impl ObjectStore for FjallStore {
                 let head_to_encoded = head_to.to_slice()?;
 
                 let existing = tx
-                    .fetch_update(&partition, head_key_to.clone(), |v| {
+                    .fetch_update(partition, head_key_to.clone(), |v| {
                         Some(v.cloned().unwrap_or_else(|| head_to_encoded.clone()))
                     })
                     .generic_err()?;
@@ -531,43 +489,23 @@ impl ObjectStore for FjallStore {
                     });
                 }
 
-                copy_data(&mut tx, partition, head_from.id, head_to.id)?;
+                copy_data(tx, partition, head_from.id, head_to.id)?;
 
-                match tx.commit().generic_err()? {
-                    Ok(()) => break,
-                    Err(_) => {
-                        // conflict, retry
-                    }
-                }
-            }
-
-            keyspace
-                .persist(fjall::PersistMode::SyncAll)
-                .generic_err()?;
-
-            Ok(())
-        })
-        .await?
+                Ok(())
+            })
+            .await
     }
 
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let handles = Arc::clone(&self.handles);
         let head_key_from = head_key(from);
         let head_key_to = head_key(to);
         let from = from.clone();
         let to = to.clone();
 
-        spawn_blocking(move || {
-            let Handles {
-                keyspace,
-                partition,
-            } = handles.as_ref();
-
-            loop {
-                let mut tx = keyspace.write_tx().generic_err()?;
-
+        self.handles
+            .write_transaction(move |tx, partition| {
                 let Some(head) = tx
-                    .fetch_update(&partition, head_key_from.clone(), |_| None)
+                    .fetch_update(partition, head_key_from.clone(), |_| None)
                     .generic_err()?
                 else {
                     return Err(Error::NotFound {
@@ -577,7 +515,7 @@ impl ObjectStore for FjallStore {
                 };
 
                 let existing = tx
-                    .fetch_update(&partition, head_key_to.clone(), |_| Some(head.clone()))
+                    .fetch_update(partition, head_key_to.clone(), |_| Some(head.clone()))
                     .generic_err()?;
 
                 if existing.is_some() {
@@ -587,21 +525,9 @@ impl ObjectStore for FjallStore {
                     });
                 }
 
-                match tx.commit().generic_err()? {
-                    Ok(()) => break,
-                    Err(_) => {
-                        // conflict, retry
-                    }
-                }
-            }
-
-            keyspace
-                .persist(fjall::PersistMode::SyncAll)
-                .generic_err()?;
-
-            Ok(())
-        })
-        .await?
+                Ok(())
+            })
+            .await
     }
 }
 
