@@ -21,9 +21,20 @@ const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard
     .with_variable_int_encoding()
     .with_no_limit();
 
+struct Handles {
+    keyspace: TransactionalKeyspace,
+    partition: TransactionalPartitionHandle,
+}
+
+impl std::fmt::Debug for Handles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handles").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
 pub struct FjallStore {
-    keyspace: Arc<TransactionalKeyspace>,
-    partition: Arc<TransactionalPartitionHandle>,
+    handles: Arc<Handles>,
 }
 
 impl FjallStore {
@@ -33,25 +44,21 @@ impl FjallStore {
     {
         let config = fjall::Config::new(path);
 
-        let (keyspace, partition) = spawn_blocking(move || {
+        let handles = spawn_blocking(move || {
             let keyspace = TransactionalKeyspace::open(config).generic_err()?;
             let partition = keyspace
                 .open_partition("object-store", fjall::PartitionCreateOptions::default())
                 .generic_err()?;
-            Result::<_, Error>::Ok((keyspace, partition))
+            Result::<_, Error>::Ok(Handles {
+                keyspace,
+                partition,
+            })
         })
         .await??;
 
         Ok(Self {
-            keyspace: Arc::new(keyspace),
-            partition: Arc::new(partition),
+            handles: Arc::new(handles),
         })
-    }
-}
-
-impl std::fmt::Debug for FjallStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FjallStore").finish_non_exhaustive()
     }
 }
 
@@ -95,10 +102,14 @@ impl ObjectStore for FjallStore {
             id,
         };
         let data_key_prefix = data_key_prefix(head.id);
-        let keyspace = Arc::clone(&self.keyspace);
-        let partition = Arc::clone(&self.partition);
+        let handles = Arc::clone(&self.handles);
 
         spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partition,
+            } = handles.as_ref();
+
             let head_encoded = head.to_slice()?;
 
             loop {
@@ -186,11 +197,15 @@ impl ObjectStore for FjallStore {
             return Err(Error::NotImplemented);
         }
 
-        let keyspace = Arc::clone(&self.keyspace);
-        let partition = Arc::clone(&self.partition);
+        let handles = Arc::clone(&self.handles);
         let location = location.clone();
         let head_key = head_key(&location);
         spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partition,
+            } = handles.as_ref();
+
             let tx = keyspace.read_tx();
 
             let Some(head) = tx.get(&partition, head_key).generic_err()? else {
@@ -240,10 +255,14 @@ impl ObjectStore for FjallStore {
 
     async fn delete(&self, location: &Path) -> Result<()> {
         let head_key = head_key(location);
-        let keyspace = Arc::clone(&self.keyspace);
-        let partition = Arc::clone(&self.partition);
+        let handles = Arc::clone(&self.handles);
 
         spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partition,
+            } = handles.as_ref();
+
             loop {
                 let mut tx = keyspace.write_tx().generic_err()?;
 
@@ -275,13 +294,17 @@ impl ObjectStore for FjallStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        let keyspace = Arc::clone(&self.keyspace);
-        let partition = Arc::clone(&self.partition);
+        let handles = Arc::clone(&self.handles);
         let head_key_prefix = head_key_prefix(prefix);
         let prefix = prefix.cloned().unwrap_or_default();
 
         futures::stream::once(async move {
             spawn_blocking(move || {
+                let Handles {
+                    keyspace,
+                    partition,
+                } = handles.as_ref();
+
                 let tx = keyspace.read_tx();
 
                 let mut metas = Vec::new();
@@ -308,11 +331,16 @@ impl ObjectStore for FjallStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        let keyspace = Arc::clone(&self.keyspace);
-        let partition = Arc::clone(&self.partition);
+        let handles = Arc::clone(&self.handles);
         let head_key_prefix = head_key_prefix(prefix);
         let prefix = prefix.cloned().unwrap_or_default();
+
         spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partition,
+            } = handles.as_ref();
+
             let tx = keyspace.read_tx();
 
             let mut common_prefixes = BTreeSet::new();
@@ -350,12 +378,17 @@ impl ObjectStore for FjallStore {
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        let keyspace = Arc::clone(&self.keyspace);
-        let partition = Arc::clone(&self.partition);
+        let handles = Arc::clone(&self.handles);
         let head_key_from = head_key(from);
         let head_key_to = head_key(to);
         let from = from.clone();
+
         spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partition,
+            } = handles.as_ref();
+
             loop {
                 let mut tx = keyspace.write_tx().generic_err()?;
 
