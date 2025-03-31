@@ -123,8 +123,7 @@ impl ObjectStore for FjallStore {
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    let data_key_prefix = crate::data_key_prefix(head.id);
-                    clear_data(&mut tx, &partition, data_key_prefix.clone())?;
+                    clear_data(&mut tx, &partition, head.id)?;
                 }
 
                 for (idx, data) in payload.iter().enumerate() {
@@ -273,8 +272,7 @@ impl ObjectStore for FjallStore {
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    let data_key_prefix = data_key_prefix(head.id);
-                    clear_data(&mut tx, &partition, data_key_prefix.clone())?;
+                    clear_data(&mut tx, &partition, head.id)?;
                 }
 
                 match tx.commit().generic_err()? {
@@ -401,13 +399,11 @@ impl ObjectStore for FjallStore {
                     });
                 };
                 let head_from = Head::from_slice(&head_from)?;
-                let data_key_prefix_from = data_key_prefix(head_from.id);
 
                 let head_to = Head {
                     id: Uuid::new_v4(),
                     ..head_from
                 };
-                let data_key_prefix_to = data_key_prefix(head_to.id);
                 let head_to_encoded = head_to.to_slice()?;
 
                 let existing = tx
@@ -418,18 +414,10 @@ impl ObjectStore for FjallStore {
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    let data_key_prefix = crate::data_key_prefix(head.id);
-                    clear_data(&mut tx, &partition, data_key_prefix)?;
+                    clear_data(&mut tx, &partition, head.id)?;
                 }
 
-                let to_copy = tx
-                    .prefix(&partition, data_key_prefix_from)
-                    .map(|res| res.map(|(_k, v)| v).generic_err())
-                    .collect::<Result<Vec<_>>>()?;
-                for (idx, data) in to_copy.into_iter().enumerate() {
-                    let data_key = data_key(data_key_prefix_to.clone(), idx);
-                    tx.insert(&partition, data_key, data.clone());
-                }
+                copy_data(&mut tx, partition, head_from.id, head_to.id)?;
 
                 match tx.commit().generic_err()? {
                     Ok(()) => break,
@@ -479,8 +467,7 @@ impl ObjectStore for FjallStore {
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    let data_key_prefix = crate::data_key_prefix(head.id);
-                    clear_data(&mut tx, &partition, data_key_prefix)?;
+                    clear_data(&mut tx, &partition, head.id)?;
                 }
 
                 match tx.commit().generic_err()? {
@@ -500,8 +487,121 @@ impl ObjectStore for FjallStore {
         .await?
     }
 
-    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> Result<()> {
-        Err(Error::NotImplemented)
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+        let handles = Arc::clone(&self.handles);
+        let head_key_from = head_key(from);
+        let head_key_to = head_key(to);
+        let from = from.clone();
+        let to = to.clone();
+
+        spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partition,
+            } = handles.as_ref();
+
+            loop {
+                let mut tx = keyspace.write_tx().generic_err()?;
+
+                let Some(head_from) = tx.get(&partition, head_key_from.clone()).generic_err()?
+                else {
+                    return Err(Error::NotFound {
+                        path: from.to_string(),
+                        source: "not found".to_owned().into(),
+                    });
+                };
+                let head_from = Head::from_slice(&head_from)?;
+
+                let head_to = Head {
+                    id: Uuid::new_v4(),
+                    ..head_from
+                };
+                let head_to_encoded = head_to.to_slice()?;
+
+                let existing = tx
+                    .fetch_update(&partition, head_key_to.clone(), |v| {
+                        Some(v.cloned().unwrap_or_else(|| head_to_encoded.clone()))
+                    })
+                    .generic_err()?;
+
+                if existing.is_some() {
+                    return Err(Error::AlreadyExists {
+                        path: to.to_string(),
+                        source: "already exists".into(),
+                    });
+                }
+
+                copy_data(&mut tx, partition, head_from.id, head_to.id)?;
+
+                match tx.commit().generic_err()? {
+                    Ok(()) => break,
+                    Err(_) => {
+                        // conflict, retry
+                    }
+                }
+            }
+
+            keyspace
+                .persist(fjall::PersistMode::SyncAll)
+                .generic_err()?;
+
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+        let handles = Arc::clone(&self.handles);
+        let head_key_from = head_key(from);
+        let head_key_to = head_key(to);
+        let from = from.clone();
+        let to = to.clone();
+
+        spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partition,
+            } = handles.as_ref();
+
+            loop {
+                let mut tx = keyspace.write_tx().generic_err()?;
+
+                let Some(head) = tx
+                    .fetch_update(&partition, head_key_from.clone(), |_| None)
+                    .generic_err()?
+                else {
+                    return Err(Error::NotFound {
+                        path: from.to_string(),
+                        source: "not found".to_owned().into(),
+                    });
+                };
+
+                let existing = tx
+                    .fetch_update(&partition, head_key_to.clone(), |_| Some(head.clone()))
+                    .generic_err()?;
+
+                if existing.is_some() {
+                    return Err(Error::AlreadyExists {
+                        path: to.to_string(),
+                        source: "already exists".into(),
+                    });
+                }
+
+                match tx.commit().generic_err()? {
+                    Ok(()) => break,
+                    Err(_) => {
+                        // conflict, retry
+                    }
+                }
+            }
+
+            keyspace
+                .persist(fjall::PersistMode::SyncAll)
+                .generic_err()?;
+
+            Ok(())
+        })
+        .await?
     }
 }
 
@@ -634,8 +734,9 @@ fn path_from_head_key(key: &[u8]) -> Result<Path> {
 fn clear_data(
     tx: &mut WriteTransaction,
     partition: &TransactionalPartitionHandle,
-    data_key_prefix: Slice,
+    id: Uuid,
 ) -> Result<()> {
+    let data_key_prefix = data_key_prefix(id);
     let to_delete = tx
         .prefix(partition, data_key_prefix)
         .map(|res| res.map(|(k, _v)| k).generic_err())
@@ -643,6 +744,28 @@ fn clear_data(
 
     for k in to_delete {
         tx.remove(partition, k);
+    }
+
+    Ok(())
+}
+
+fn copy_data(
+    tx: &mut WriteTransaction,
+    partition: &TransactionalPartitionHandle,
+    id_from: Uuid,
+    id_to: Uuid,
+) -> Result<()> {
+    let data_key_prefix_from = data_key_prefix(id_from);
+    let data_key_prefix_to = data_key_prefix(id_to);
+
+    let to_copy = tx
+        .prefix(&partition, data_key_prefix_from)
+        .map(|res| res.map(|(_k, v)| v).generic_err())
+        .collect::<Result<Vec<_>>>()?;
+
+    for (idx, data) in to_copy.into_iter().enumerate() {
+        let data_key = data_key(data_key_prefix_to.clone(), idx);
+        tx.insert(&partition, data_key, data.clone());
     }
 
     Ok(())
@@ -656,8 +779,8 @@ fn head_key_prefix(prefix: Option<&Path>) -> Slice {
     format!("head\0{}", prefix.map(|p| p.as_ref()).unwrap_or_default()).into()
 }
 
-fn data_key_prefix(e_tag: Uuid) -> Slice {
-    format!("data\0{e_tag}\0").into()
+fn data_key_prefix(id: Uuid) -> Slice {
+    format!("data\0{id}\0").into()
 }
 
 fn data_key(data_key_prefix: Slice, idx: usize) -> Slice {
@@ -673,6 +796,14 @@ mod integration_tests {
     use super::*;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
+
+    #[tokio::test]
+    async fn copy_if_not_exists() {
+        let path = tempfile::tempdir().unwrap();
+        let storage = FjallStore::open(path.path()).await.unwrap();
+
+        object_store::integration::copy_if_not_exists(&storage).await;
+    }
 
     #[tokio::test]
     async fn get_nonexistent_location() {
