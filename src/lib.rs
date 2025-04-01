@@ -256,12 +256,10 @@ impl ObjectStore for FjallStore {
                     let (_k, v) = kv_res.generic_err()?;
 
                     let v = Bytes::from(v);
-                    let v_sliced = v.slice(
-                        (range.start as usize).saturating_sub(pos)
-                            ..(range.end as usize).saturating_sub(pos),
-                    );
-                    if !v_sliced.is_empty() {
-                        parts.push(Ok(v_sliced));
+                    let v_range = (range.start as usize).saturating_sub(pos)
+                        ..(range.end as usize).saturating_sub(pos).min(v.len());
+                    if !v_range.is_empty() {
+                        parts.push(Ok(v.slice(v_range)));
                     }
                     pos += v.len();
                 }
