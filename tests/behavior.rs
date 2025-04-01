@@ -112,3 +112,36 @@ async fn test_empty_blocks() {
     let expected = [Bytes::from_static(b"foo"), Bytes::from_static(b"bar")];
     assert_eq!(actual, expected);
 }
+
+#[tokio::test]
+async fn test_get_opts_head() {
+    let path = tempfile::tempdir().unwrap();
+    let storage = FjallStore::open(path.path()).await.unwrap();
+
+    let path = Path::parse("x").unwrap();
+    let payload = [
+        Bytes::from_static(b"foo"),
+        Bytes::from_static(b"bar"),
+        Bytes::from_static(b"x"),
+    ]
+    .into_iter()
+    .collect();
+    storage.put(&path, payload).await.unwrap();
+
+    let get_res = storage
+        .get_opts(
+            &path,
+            GetOptions {
+                head: true,
+                range: Some((1..4).into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_res.meta.size, 7);
+    assert_eq!(get_res.range, 1..4);
+
+    let bytes = get_res.into_stream().try_collect::<Vec<_>>().await.unwrap();
+    assert!(bytes.is_empty());
+}

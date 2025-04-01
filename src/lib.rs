@@ -6,6 +6,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTransaction};
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use get_options::GetOptionsExt;
 use get_range::GetRangeExt;
 use object_store::{
     Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
@@ -13,6 +14,7 @@ use object_store::{
 };
 use uuid::Uuid;
 
+mod get_options;
 mod get_range;
 
 const STORE: &str = "fjall";
@@ -201,11 +203,9 @@ impl ObjectStore for FjallStore {
             })
             .await?;
 
-        let id = id.to_string();
-
         Ok(PutResult {
-            e_tag: Some(id.clone()),
-            version: Some(id),
+            e_tag: Some(id.to_string()),
+            version: None,
         })
     }
 
@@ -218,35 +218,6 @@ impl ObjectStore for FjallStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let GetOptions {
-            if_match,
-            if_none_match,
-            if_modified_since,
-            if_unmodified_since,
-            range,
-            version,
-            head: only_head,
-            // ignore extensions
-            extensions: _,
-        } = options;
-
-        // TODO: implement these
-        if if_match.is_some() {
-            return Err(Error::NotImplemented);
-        }
-        if if_none_match.is_some() {
-            return Err(Error::NotImplemented);
-        }
-        if if_modified_since.is_some() {
-            return Err(Error::NotImplemented);
-        }
-        if if_unmodified_since.is_some() {
-            return Err(Error::NotImplemented);
-        }
-        if version.is_some() {
-            return Err(Error::NotImplemented);
-        }
-
         let handles = Arc::clone(&self.handles);
         let location = location.clone();
         let head_key = head_key(&location);
@@ -265,14 +236,16 @@ impl ObjectStore for FjallStore {
                 });
             };
             let head = Head::from_slice(&head)?;
+            let meta = head.into_meta(location.clone());
+            options.check_preconditions(&meta)?;
 
-            let range = match range {
+            let range = match options.range {
                 None => 0..head.size,
                 Some(range) => range.as_range(head.size).generic_err()?,
             };
 
             let mut parts = Vec::new();
-            if !range.is_empty() && !only_head {
+            if !range.is_empty() && !options.head {
                 let mut pos = 0usize;
 
                 let data_key_prefix = data_key_prefix(head.id);
@@ -293,7 +266,7 @@ impl ObjectStore for FjallStore {
                 payload: object_store::GetResultPayload::Stream(
                     futures::stream::iter(parts).boxed(),
                 ),
-                meta: head.into_meta(location),
+                meta,
                 range,
                 attributes: Default::default(),
             })
@@ -622,21 +595,19 @@ impl Head {
         Ok(data.into())
     }
 
-    fn into_meta(self, path: Path) -> ObjectMeta {
+    fn into_meta(&self, path: Path) -> ObjectMeta {
         let Head {
             last_modified,
             size,
             id,
         } = self;
 
-        let id = id.to_string();
-
         ObjectMeta {
             location: path,
-            last_modified,
-            size,
-            e_tag: Some(id.clone()),
-            version: Some(id),
+            last_modified: *last_modified,
+            size: *size,
+            e_tag: Some(id.to_string()),
+            version: None,
         }
     }
 }

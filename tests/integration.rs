@@ -31,6 +31,14 @@ async fn get_nonexistent_location() {
 }
 
 #[tokio::test]
+async fn get_opts() {
+    let path = tempfile::tempdir().unwrap();
+    let storage = FjallStore::open(path.path()).await.unwrap();
+
+    object_store::integration::get_opts(&storage).await;
+}
+
+#[tokio::test]
 async fn list_uses_directories_correctly() {
     let path = tempfile::tempdir().unwrap();
     let storage = FjallStore::open(path.path()).await.unwrap();
