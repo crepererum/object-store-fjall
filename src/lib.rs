@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fmt::Write, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
@@ -21,17 +21,20 @@ const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard
     .with_variable_int_encoding()
     .with_no_limit();
 
+struct Partitions {
+    head: TransactionalPartitionHandle,
+    data: TransactionalPartitionHandle,
+}
+
 struct Handles {
     keyspace: TransactionalKeyspace,
-    partition: TransactionalPartitionHandle,
+    partitions: Partitions,
 }
 
 impl Handles {
     async fn write_transaction<F>(self: &Arc<Self>, f: F) -> Result<()>
     where
-        F: for<'a> Fn(&'a mut WriteTransaction, &'a TransactionalPartitionHandle) -> Result<()>
-            + Send
-            + 'static,
+        F: for<'a> Fn(&'a mut WriteTransaction, &'a Partitions) -> Result<()> + Send + 'static,
     {
         let mut f = f;
 
@@ -41,12 +44,12 @@ impl Handles {
             let (done, f_back) = spawn_blocking(move || {
                 let Self {
                     keyspace,
-                    partition,
+                    partitions,
                 } = this.as_ref();
 
                 let mut tx = keyspace.write_tx().generic_err()?;
 
-                f(&mut tx, partition)?;
+                f(&mut tx, partitions)?;
 
                 match tx.commit().generic_err()? {
                     Ok(()) => {
@@ -89,16 +92,26 @@ impl FjallStore {
     where
         P: AsRef<std::path::Path>,
     {
-        let config = fjall::Config::new(path);
+        let config = fjall::Config::new(path).manual_journal_persist(true);
 
         let handles = spawn_blocking(move || {
             let keyspace = TransactionalKeyspace::open(config).generic_err()?;
-            let partition = keyspace
-                .open_partition("object-store", fjall::PartitionCreateOptions::default())
+
+            let head = keyspace
+                .open_partition("head", fjall::PartitionCreateOptions::default())
                 .generic_err()?;
+
+            let data = keyspace
+                .open_partition(
+                    "data",
+                    fjall::PartitionCreateOptions::default()
+                        .with_kv_separation(fjall::KvSeparationOptions::default()),
+                )
+                .generic_err()?;
+
             Result::<_, Error>::Ok(Handles {
                 keyspace,
-                partition,
+                partitions: Partitions { head, data },
             })
         })
         .await??;
@@ -152,16 +165,16 @@ impl ObjectStore for FjallStore {
         let data_key_prefix = data_key_prefix(head.id);
 
         self.handles
-            .write_transaction(move |tx, partition| {
+            .write_transaction(move |tx, partitions| {
                 let existing = tx
-                    .fetch_update(partition, head_key.clone(), |_| {
+                    .fetch_update(&partitions.head, head_key.clone(), |_| {
                         Some(head_encoded.clone().into())
                     })
                     .generic_err()?;
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    clear_data(tx, partition, head.id)?;
+                    clear_data(tx, &partitions.data, head.id)?;
                 }
 
                 for (idx, data) in payload.iter().enumerate() {
@@ -169,8 +182,8 @@ impl ObjectStore for FjallStore {
                         continue;
                     }
 
-                    let data_key = data_key(data_key_prefix.clone(), idx);
-                    tx.insert(partition, data_key, data.clone());
+                    let data_key = data_key(data_key_prefix.clone(), idx as u64);
+                    tx.insert(&partitions.data, data_key, data.clone());
                 }
 
                 Ok(())
@@ -229,12 +242,12 @@ impl ObjectStore for FjallStore {
         spawn_blocking(move || {
             let Handles {
                 keyspace,
-                partition,
+                partitions,
             } = handles.as_ref();
 
             let tx = keyspace.read_tx();
 
-            let Some(head) = tx.get(&partition, head_key).generic_err()? else {
+            let Some(head) = tx.get(&partitions.head, head_key).generic_err()? else {
                 return Err(Error::NotFound {
                     path: location.to_string(),
                     source: "not found".to_owned().into(),
@@ -252,7 +265,7 @@ impl ObjectStore for FjallStore {
                 let mut pos = 0usize;
 
                 let data_key_prefix = data_key_prefix(head.id);
-                for kv_res in tx.prefix(&partition, data_key_prefix) {
+                for kv_res in tx.prefix(&partitions.data, data_key_prefix) {
                     let (_k, v) = kv_res.generic_err()?;
 
                     let v = Bytes::from(v);
@@ -281,14 +294,14 @@ impl ObjectStore for FjallStore {
         let head_key = head_key(location);
 
         self.handles
-            .write_transaction(move |tx, partition| {
+            .write_transaction(move |tx, partitions| {
                 let existing = tx
-                    .fetch_update(partition, head_key.clone(), |_| None)
+                    .fetch_update(&partitions.head, head_key.clone(), |_| None)
                     .generic_err()?;
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    clear_data(tx, partition, head.id)?;
+                    clear_data(tx, &partitions.data, head.id)?;
                 }
 
                 Ok(())
@@ -305,13 +318,13 @@ impl ObjectStore for FjallStore {
             spawn_blocking(move || {
                 let Handles {
                     keyspace,
-                    partition,
+                    partitions,
                 } = handles.as_ref();
 
                 let tx = keyspace.read_tx();
 
                 let mut metas = Vec::new();
-                for kv_res in tx.prefix(&partition, head_key_prefix) {
+                for kv_res in tx.prefix(&partitions.head, head_key_prefix) {
                     let (k, v) = kv_res.generic_err()?;
                     let path = path_from_head_key(&k)?;
 
@@ -341,14 +354,14 @@ impl ObjectStore for FjallStore {
         spawn_blocking(move || {
             let Handles {
                 keyspace,
-                partition,
+                partitions,
             } = handles.as_ref();
 
             let tx = keyspace.read_tx();
 
             let mut common_prefixes = BTreeSet::new();
             let mut objects = vec![];
-            for kv_res in tx.prefix(&partition, head_key_prefix) {
+            for kv_res in tx.prefix(&partitions.head, head_key_prefix) {
                 let (k, v) = kv_res.generic_err()?;
                 let path = path_from_head_key(&k)?;
 
@@ -386,8 +399,10 @@ impl ObjectStore for FjallStore {
         let from = from.clone();
 
         self.handles
-            .write_transaction(move |tx, partition| {
-                let Some(head_from) = tx.get(partition, head_key_from.clone()).generic_err()?
+            .write_transaction(move |tx, partitions| {
+                let Some(head_from) = tx
+                    .get(&partitions.head, head_key_from.clone())
+                    .generic_err()?
                 else {
                     return Err(Error::NotFound {
                         path: from.to_string(),
@@ -403,17 +418,17 @@ impl ObjectStore for FjallStore {
                 let head_to_encoded = head_to.to_slice()?;
 
                 let existing = tx
-                    .fetch_update(partition, head_key_to.clone(), |_| {
+                    .fetch_update(&partitions.head, head_key_to.clone(), |_| {
                         Some(head_to_encoded.clone().into())
                     })
                     .generic_err()?;
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    clear_data(tx, partition, head.id)?;
+                    clear_data(tx, &partitions.data, head.id)?;
                 }
 
-                copy_data(tx, partition, head_from.id, head_to.id)?;
+                copy_data(tx, &partitions.data, head_from.id, head_to.id)?;
 
                 Ok(())
             })
@@ -426,9 +441,9 @@ impl ObjectStore for FjallStore {
         let from = from.clone();
 
         self.handles
-            .write_transaction(move |tx, partition| {
+            .write_transaction(move |tx, partitions| {
                 let Some(head) = tx
-                    .fetch_update(partition, head_key_from.clone(), |_| None)
+                    .fetch_update(&partitions.head, head_key_from.clone(), |_| None)
                     .generic_err()?
                 else {
                     return Err(Error::NotFound {
@@ -438,12 +453,14 @@ impl ObjectStore for FjallStore {
                 };
 
                 let existing = tx
-                    .fetch_update(partition, head_key_to.clone(), |_| Some(head.clone()))
+                    .fetch_update(&partitions.head, head_key_to.clone(), |_| {
+                        Some(head.clone())
+                    })
                     .generic_err()?;
 
                 if let Some(head) = existing {
                     let head = Head::from_slice(&head)?;
-                    clear_data(tx, partition, head.id)?;
+                    clear_data(tx, &partitions.data, head.id)?;
                 }
 
                 Ok(())
@@ -458,8 +475,10 @@ impl ObjectStore for FjallStore {
         let to = to.clone();
 
         self.handles
-            .write_transaction(move |tx, partition| {
-                let Some(head_from) = tx.get(partition, head_key_from.clone()).generic_err()?
+            .write_transaction(move |tx, partitions| {
+                let Some(head_from) = tx
+                    .get(&partitions.head, head_key_from.clone())
+                    .generic_err()?
                 else {
                     return Err(Error::NotFound {
                         path: from.to_string(),
@@ -475,7 +494,7 @@ impl ObjectStore for FjallStore {
                 let head_to_encoded = head_to.to_slice()?;
 
                 let existing = tx
-                    .fetch_update(partition, head_key_to.clone(), |v| {
+                    .fetch_update(&partitions.head, head_key_to.clone(), |v| {
                         Some(v.cloned().unwrap_or_else(|| head_to_encoded.clone()))
                     })
                     .generic_err()?;
@@ -487,7 +506,7 @@ impl ObjectStore for FjallStore {
                     });
                 }
 
-                copy_data(tx, partition, head_from.id, head_to.id)?;
+                copy_data(tx, &partitions.data, head_from.id, head_to.id)?;
 
                 Ok(())
             })
@@ -501,9 +520,9 @@ impl ObjectStore for FjallStore {
         let to = to.clone();
 
         self.handles
-            .write_transaction(move |tx, partition| {
+            .write_transaction(move |tx, partitions| {
                 let Some(head) = tx
-                    .fetch_update(partition, head_key_from.clone(), |_| None)
+                    .fetch_update(&partitions.head, head_key_from.clone(), |_| None)
                     .generic_err()?
                 else {
                     return Err(Error::NotFound {
@@ -513,7 +532,9 @@ impl ObjectStore for FjallStore {
                 };
 
                 let existing = tx
-                    .fetch_update(partition, head_key_to.clone(), |_| Some(head.clone()))
+                    .fetch_update(&partitions.head, head_key_to.clone(), |_| {
+                        Some(head.clone())
+                    })
                     .generic_err()?;
 
                 if existing.is_some() {
@@ -644,10 +665,7 @@ impl<Context> Decode<Context> for Head {
 }
 
 fn path_from_head_key(key: &[u8]) -> Result<Path> {
-    let Some(path) = key.strip_prefix(b"head\0") else {
-        return Err(string_err(format!("invalid head key: {key:?}")));
-    };
-    let path = String::from_utf8(path.to_owned()).generic_err()?;
+    let path = String::from_utf8(key.to_owned()).generic_err()?;
     let path = Path::parse(path)?;
     Ok(path)
 }
@@ -688,7 +706,7 @@ fn copy_data(
         .collect::<Result<Vec<_>>>()?;
 
     for (idx, data) in to_copy.into_iter().enumerate() {
-        let data_key = data_key(data_key_prefix_to.clone(), idx);
+        let data_key = data_key(data_key_prefix_to.clone(), idx as u64);
         tx.insert(&partition, data_key, data.clone());
     }
 
@@ -696,21 +714,56 @@ fn copy_data(
 }
 
 fn head_key(location: &Path) -> Slice {
-    format!("head\0{location}").into()
+    head_key_prefix(Some(location))
 }
 
 fn head_key_prefix(prefix: Option<&Path>) -> Slice {
-    format!("head\0{}", prefix.map(|p| p.as_ref()).unwrap_or_default()).into()
+    match prefix {
+        Some(p) => Bytes::copy_from_slice(p.as_ref().as_bytes()).into(),
+        None => Bytes::new().into(),
+    }
 }
 
 fn data_key_prefix(id: Uuid) -> Slice {
-    format!("data\0{id}\0").into()
+    Bytes::copy_from_slice(&id.as_u128().to_le_bytes()).into()
 }
 
-fn data_key(data_key_prefix: Slice, idx: usize) -> Slice {
+fn data_key(data_key_prefix: Slice, idx: u64) -> Slice {
     let data_key_prefix = Bytes::from(data_key_prefix);
-    let mut buf = BytesMut::with_capacity(data_key_prefix.len() + 8);
+    let mut buf = BytesMut::with_capacity(data_key_prefix.len() + 64 / 8);
     buf.put(data_key_prefix);
-    buf.write_fmt(format_args!("{idx:08}")).unwrap();
+    buf.put_slice(&idx.to_be_bytes());
     buf.freeze().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::u64;
+
+    use super::*;
+
+    #[test]
+    fn data_key_sorting() {
+        let prefix = data_key_prefix(Uuid::from_u128(1337));
+
+        let key_0 = data_key(prefix.clone(), 0);
+        let key_1 = data_key(prefix.clone(), 1);
+        let key_u8_max = data_key(prefix.clone(), u8::MAX as u64);
+        let key_u8_max_plus_1 = data_key(prefix.clone(), u8::MAX as u64 + 1);
+        let key_u64_max_minus_1 = data_key(prefix.clone(), u64::MAX - 1);
+        let key_u64_max = data_key(prefix.clone(), u64::MAX);
+
+        println!("              key_0: {key_0:?}");
+        println!("              key_1: {key_1:?}");
+        println!("         key_u8_max: {key_u8_max:?}");
+        println!("  key_u8_max_plus_1: {key_u8_max_plus_1:?}");
+        println!("key_u64_max_minus_1: {key_u64_max_minus_1:?}");
+        println!("        key_u64_max: {key_u64_max:?}");
+
+        assert!(key_0 < key_1);
+        assert!(key_1 < key_u8_max);
+        assert!(key_u8_max < key_u8_max_plus_1);
+        assert!(key_u8_max_plus_1 < key_u64_max_minus_1);
+        assert!(key_u64_max_minus_1 < key_u64_max);
+    }
 }
