@@ -4,14 +4,14 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Utc;
 use constants::STORE;
-use error::GenericResultExt;
+use error::{GenericResultExt, string_err};
 use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTransaction};
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{
     Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
     PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
-use serialization::Head;
+use serialization::{Head, WrappedAttributes};
 use uuid::Uuid;
 use vendored::{get_options::GetOptionsExt, get_range::GetRangeExt};
 
@@ -159,9 +159,6 @@ impl ObjectStore for FjallStore {
         if mode != PutMode::Overwrite {
             return Err(Error::NotImplemented);
         }
-        if !attributes.is_empty() {
-            return Err(Error::NotImplemented);
-        }
 
         let id = Uuid::now_v7();
 
@@ -172,7 +169,8 @@ impl ObjectStore for FjallStore {
             id,
         };
         let head_encoded = head.to_slice()?;
-        let data_key_prefix = data_key_prefix(head.id);
+        let data_base = data_base(head.id);
+        let data_key_prefix = data_key_prefix(data_base.clone());
 
         self.handles
             .write_transaction(move |tx, partitions| {
@@ -186,6 +184,14 @@ impl ObjectStore for FjallStore {
                     let head = Head::from_slice(&head)?;
                     clear_data(tx, &partitions.data, head.id)?;
                 }
+
+                tx.insert(
+                    &partitions.data,
+                    data_base.clone(),
+                    WrappedAttributes::from(attributes.clone())
+                        .to_slice()
+                        .generic_err()?,
+                );
 
                 for (idx, data) in payload.iter().enumerate() {
                     if data.is_empty() {
@@ -241,11 +247,20 @@ impl ObjectStore for FjallStore {
                 Some(range) => range.as_range(head.size).generic_err()?,
             };
 
+            let data_base = data_base(head.id);
+            let attributes = WrappedAttributes::from_slice(
+                tx.get(&partitions.data, data_base.clone())
+                    .generic_err()?
+                    .ok_or_else(|| string_err("attributes missing".to_owned()))?
+                    .as_ref(),
+            )?
+            .into();
+
             let mut parts = Vec::new();
             if !range.is_empty() && !options.head {
                 let mut pos = 0usize;
 
-                let data_key_prefix = data_key_prefix(head.id);
+                let data_key_prefix = data_key_prefix(data_base);
                 for kv_res in tx.prefix(&partitions.data, data_key_prefix) {
                     let (_k, v) = kv_res.generic_err()?;
 
@@ -265,7 +280,7 @@ impl ObjectStore for FjallStore {
                 ),
                 meta,
                 range,
-                attributes: Default::default(),
+                attributes,
             })
         })
         .await?
@@ -553,9 +568,11 @@ fn clear_data(
     partition: &TransactionalPartitionHandle,
     id: Uuid,
 ) -> Result<()> {
-    let data_key_prefix = data_key_prefix(id);
+    let data_base = data_base(id);
+    tx.remove(partition, data_base.clone());
+
     let to_delete = tx
-        .prefix(partition, data_key_prefix)
+        .prefix(partition, data_key_prefix(data_base))
         .map(|res| res.map(|(k, _v)| k).generic_err())
         .collect::<Result<Vec<_>>>()?;
 
@@ -572,8 +589,18 @@ fn copy_data(
     id_from: Uuid,
     id_to: Uuid,
 ) -> Result<()> {
-    let data_key_prefix_from = data_key_prefix(id_from);
-    let data_key_prefix_to = data_key_prefix(id_to);
+    let data_base_from = data_base(id_from);
+    let data_base_to = data_base(id_to);
+
+    // attributes
+    let attrs = tx
+        .get(partition, data_base_from.clone())
+        .generic_err()?
+        .ok_or_else(|| string_err("attributes missing".to_owned()))?;
+    tx.insert(&partition, data_base_to.clone(), attrs);
+
+    let data_key_prefix_from = data_key_prefix(data_base_from);
+    let data_key_prefix_to = data_key_prefix(data_base_to);
 
     let to_copy = tx
         .prefix(&partition, data_key_prefix_from)
@@ -599,8 +626,16 @@ fn head_key_prefix(prefix: Option<&Path>) -> Slice {
     }
 }
 
-fn data_key_prefix(id: Uuid) -> Slice {
+fn data_base(id: Uuid) -> Slice {
     Bytes::copy_from_slice(&id.as_u128().to_le_bytes()).into()
+}
+
+fn data_key_prefix(data_base: Slice) -> Slice {
+    let data_base = Bytes::from(data_base);
+    let mut buf = BytesMut::with_capacity(data_base.len() + 1);
+    buf.put(data_base);
+    buf.put_u8(0);
+    buf.freeze().into()
 }
 
 fn data_key(data_key_prefix: Slice, idx: u64) -> Slice {
@@ -619,7 +654,7 @@ mod tests {
 
     #[test]
     fn data_key_sorting() {
-        let prefix = data_key_prefix(Uuid::from_u128(1337));
+        let prefix = data_key_prefix(data_base(Uuid::from_u128(1337)));
 
         let key_0 = data_key(prefix.clone(), 0);
         let key_1 = data_key(prefix.clone(), 1);

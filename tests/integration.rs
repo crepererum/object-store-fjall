@@ -55,6 +55,14 @@ async fn list_with_delimiter() {
 }
 
 #[tokio::test]
+async fn put_get_attributes() {
+    let path = tempfile::tempdir().unwrap();
+    let storage = FjallStore::open(path.path()).await.unwrap();
+
+    object_store::integration::put_get_attributes(&storage).await;
+}
+
+#[tokio::test]
 async fn put_get_delete_list() {
     let path = tempfile::tempdir().unwrap();
     let storage = FjallStore::open(path.path()).await.unwrap();
