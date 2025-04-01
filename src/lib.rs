@@ -153,7 +153,7 @@ impl ObjectStore for FjallStore {
             return Err(Error::NotImplemented);
         }
 
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
 
         let head_key = head_key(location);
         let head = Head {
@@ -412,7 +412,7 @@ impl ObjectStore for FjallStore {
                 let head_from = Head::from_slice(&head_from)?;
 
                 let head_to = Head {
-                    id: Uuid::new_v4(),
+                    id: Uuid::now_v7(),
                     ..head_from
                 };
                 let head_to_encoded = head_to.to_slice()?;
@@ -488,7 +488,7 @@ impl ObjectStore for FjallStore {
                 let head_from = Head::from_slice(&head_from)?;
 
                 let head_to = Head {
-                    id: Uuid::new_v4(),
+                    id: Uuid::now_v7(),
                     ..head_from
                 };
                 let head_to_encoded = head_to.to_slice()?;
