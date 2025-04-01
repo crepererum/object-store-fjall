@@ -1,27 +1,24 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
-use bincode::{Decode, Encode};
 use bytes::{BufMut, Bytes, BytesMut};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
+use constants::STORE;
+use error::GenericResultExt;
 use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTransaction};
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
-use get_options::GetOptionsExt;
-use get_range::GetRangeExt;
 use object_store::{
     Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
     PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
+use serialization::Head;
 use uuid::Uuid;
+use vendored::{get_options::GetOptionsExt, get_range::GetRangeExt};
 
-mod get_options;
-mod get_range;
-
-const STORE: &str = "fjall";
-const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard()
-    .with_little_endian()
-    .with_variable_int_encoding()
-    .with_no_limit();
+mod constants;
+mod error;
+mod serialization;
+mod vendored;
 
 struct Partitions {
     head: TransactionalPartitionHandle,
@@ -540,110 +537,6 @@ where
     R: Send + 'static,
 {
     tokio::task::spawn_blocking(f).await.generic_err()
-}
-
-trait GenericResultExt {
-    type T;
-
-    fn generic_err(self) -> Result<Self::T>;
-}
-
-impl<T, E> GenericResultExt for Result<T, E>
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    type T = T;
-
-    fn generic_err(self) -> Result<Self::T> {
-        self.map_err(|e| Error::Generic {
-            store: STORE,
-            source: Box::new(e),
-        })
-    }
-}
-
-fn string_err(s: String) -> Error {
-    Error::Generic {
-        store: STORE,
-        source: s.into(),
-    }
-}
-
-struct Head {
-    last_modified: DateTime<Utc>,
-    size: u64,
-    id: Uuid,
-}
-
-impl Head {
-    fn from_slice(s: &[u8]) -> Result<Self> {
-        let (this, read) = bincode::decode_from_slice(s, BINCODE_CONFIG).map_err(|e| {
-            // why do they not implement std::error::Error?!
-            string_err(e.to_string())
-        })?;
-        if read != s.len() {
-            return Err(string_err(format!("trailing bytes: {}", s.len() - read)));
-        }
-        Ok(this)
-    }
-
-    fn to_slice(&self) -> Result<Slice> {
-        let data = Bytes::from(bincode::encode_to_vec(self, BINCODE_CONFIG).map_err(|e| {
-            // why do they not implement std::error::Error?!
-            string_err(e.to_string())
-        })?);
-        Ok(data.into())
-    }
-
-    fn into_meta(&self, path: Path) -> ObjectMeta {
-        let Head {
-            last_modified,
-            size,
-            id,
-        } = self;
-
-        ObjectMeta {
-            location: path,
-            last_modified: *last_modified,
-            size: *size,
-            e_tag: Some(id.to_string()),
-            version: None,
-        }
-    }
-}
-
-impl Encode for Head {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
-        self.last_modified.timestamp().encode(encoder)?;
-        self.last_modified
-            .timestamp_subsec_nanos()
-            .encode(encoder)?;
-
-        self.size.encode(encoder)?;
-
-        self.id.as_u128().encode(encoder)?;
-
-        Ok(())
-    }
-}
-
-impl<Context> Decode<Context> for Head {
-    fn decode<D: bincode::de::Decoder<Context = Context>>(
-        decoder: &mut D,
-    ) -> std::result::Result<Self, bincode::error::DecodeError> {
-        Ok(Self {
-            last_modified: DateTime::from_timestamp(
-                Decode::decode(decoder)?,
-                Decode::decode(decoder)?,
-            )
-            .ok_or(bincode::error::DecodeError::Other("invalid timestamp"))?,
-            size: Decode::decode(decoder)?,
-            id: Uuid::from_u128(Decode::decode(decoder)?),
-        })
-    }
 }
 
 fn path_from_head_key(key: &[u8]) -> Result<Path> {
