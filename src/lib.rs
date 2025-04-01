@@ -92,19 +92,30 @@ impl FjallStore {
     where
         P: AsRef<std::path::Path>,
     {
-        let config = fjall::Config::new(path).manual_journal_persist(true);
+        let config = fjall::Config::new(path)
+            .manual_journal_persist(true)
+            .max_write_buffer_size(128 * 1024 * 1024);
 
         let handles = spawn_blocking(move || {
             let keyspace = TransactionalKeyspace::open(config).generic_err()?;
 
             let head = keyspace
-                .open_partition("head", fjall::PartitionCreateOptions::default())
+                .open_partition(
+                    "head",
+                    fjall::PartitionCreateOptions::default()
+                        .compression(fjall::CompressionType::None)
+                        .manual_journal_persist(true),
+                )
                 .generic_err()?;
 
             let data = keyspace
                 .open_partition(
                     "data",
                     fjall::PartitionCreateOptions::default()
+                        .bloom_filter_bits(None)
+                        .compression(fjall::CompressionType::None)
+                        .manual_journal_persist(true)
+                        .max_memtable_size(64 * 1024 * 1024)
                         .with_kv_separation(fjall::KvSeparationOptions::default()),
                 )
                 .generic_err()?;
