@@ -82,6 +82,21 @@ impl std::fmt::Debug for Handles {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FjallStatistics {
+    /// Number of head entries.
+    pub head_len: usize,
+
+    /// Disk space used by the "head" partition.
+    pub head_disk_space: u64,
+
+    /// Number of data entries.
+    pub data_len: usize,
+
+    /// Disk space used by the "data" partition.
+    pub data_disk_space: u64,
+}
+
 #[derive(Debug)]
 pub struct FjallStore {
     handles: Arc<Handles>,
@@ -130,6 +145,33 @@ impl FjallStore {
         Ok(Self {
             handles: Arc::new(handles),
         })
+    }
+
+    pub async fn stats(&self) -> Result<FjallStatistics> {
+        let handles = Arc::clone(&self.handles);
+        spawn_blocking(move || {
+            let Handles {
+                keyspace: _,
+                partitions,
+            } = handles.as_ref();
+            let Partitions { head, data } = partitions;
+
+            let head = head.inner();
+            let head_len = head.len().generic_err()?;
+            let head_disk_space = head.disk_space();
+
+            let data = data.inner();
+            let data_len = data.len().generic_err()?;
+            let data_disk_space = data.disk_space();
+
+            Ok(FjallStatistics {
+                head_len,
+                head_disk_space,
+                data_len,
+                data_disk_space,
+            })
+        })
+        .await?
     }
 }
 
