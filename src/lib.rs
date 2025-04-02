@@ -6,12 +6,13 @@ use chrono::Utc;
 use constants::STORE;
 use error::{GenericResultExt, string_err};
 use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTransaction};
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use object_store::{
     Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
     PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 use serialization::{Head, WrappedAttributes};
+use tokio::{sync::mpsc::Receiver, task::JoinSet};
 use uuid::Uuid;
 use vendored::{get_options::GetOptionsExt, get_range::GetRangeExt};
 
@@ -256,28 +257,48 @@ impl ObjectStore for FjallStore {
             )?
             .into();
 
-            let mut parts = Vec::new();
-            if !range.is_empty() && !options.head {
-                let mut pos = 0usize;
+            let stream = if !range.is_empty() && !options.head {
+                // Producer and consumer now run in two different threads and context switching is expensive, so we
+                // want to avoid that. Hence we give the buffer some head room.
+                let (sender, rx) = tokio::sync::mpsc::channel(5);
 
-                let data_key_prefix = data_key_prefix(data_base);
-                for kv_res in tx.prefix(&partitions.data, data_key_prefix) {
-                    let (_k, v) = kv_res.generic_err()?;
+                let mut task = JoinSet::new();
+                task.spawn_blocking(move || {
+                    let Handles {
+                        keyspace: _,
+                        partitions,
+                    } = handles.as_ref();
 
-                    let v = Bytes::from(v);
-                    let v_range = (range.start as usize).saturating_sub(pos)
-                        ..(range.end as usize).saturating_sub(pos).min(v.len());
-                    if !v_range.is_empty() {
-                        parts.push(Ok(v.slice(v_range)));
+                    let mut pos = 0usize;
+                    let data_key_prefix = data_key_prefix(data_base);
+                    for kv_res in tx.prefix(&partitions.data, data_key_prefix) {
+                        let v = match kv_res {
+                            Ok((_k, v)) => v,
+                            Err(e) => {
+                                sender.blocking_send(Err(e).generic_err()).ok();
+                                return;
+                            }
+                        };
+
+                        let v = Bytes::from(v);
+                        let v_range = (range.start as usize).saturating_sub(pos)
+                            ..(range.end as usize).saturating_sub(pos).min(v.len());
+                        if !v_range.is_empty() {
+                            if sender.blocking_send(Ok(v.slice(v_range))).is_err() {
+                                return;
+                            }
+                        }
+                        pos += v.len();
                     }
-                    pos += v.len();
-                }
-            }
+                });
+
+                GetStream { _task: task, rx }.boxed()
+            } else {
+                futures::stream::empty().boxed()
+            };
 
             Ok(GetResult {
-                payload: object_store::GetResultPayload::Stream(
-                    futures::stream::iter(parts).boxed(),
-                ),
+                payload: object_store::GetResultPayload::Stream(stream),
                 meta,
                 range,
                 attributes,
@@ -309,37 +330,57 @@ impl ObjectStore for FjallStore {
         let handles = Arc::clone(&self.handles);
         let head_key_prefix = head_key_prefix(prefix);
         let prefix = prefix.cloned().unwrap_or_default();
+        let mut task = JoinSet::new();
 
-        futures::stream::once(async move {
-            spawn_blocking(move || {
-                let Handles {
-                    keyspace,
-                    partitions,
-                } = handles.as_ref();
+        // Producer and consumer now run in two different threads and context switching is expensive, so we
+        // want to avoid that. Hence we give the buffer some head room.
+        let (sender, rx) = tokio::sync::mpsc::channel(100);
 
-                let tx = keyspace.read_tx();
+        task.spawn_blocking(move || {
+            let Handles {
+                keyspace,
+                partitions,
+            } = handles.as_ref();
 
-                let mut metas = Vec::new();
-                for kv_res in tx.prefix(&partitions.head, head_key_prefix) {
-                    let (k, v) = kv_res.generic_err()?;
-                    let path = path_from_head_key(&k)?;
+            let tx = keyspace.read_tx();
 
-                    // Don't return for exact prefix match
-                    if path
-                        .prefix_match(&prefix)
-                        .map(|mut x| x.next().is_some())
-                        .unwrap_or(false)
-                    {
-                        metas.push(Ok(Head::from_slice(&v)?.into_meta(path)));
+            for kv_res in tx.prefix(&partitions.head, head_key_prefix) {
+                let (k, v) = match kv_res {
+                    Ok((k, v)) => (k, v),
+                    Err(e) => {
+                        sender.blocking_send(Err(e).generic_err()).ok();
+                        return;
+                    }
+                };
+                let path = match path_from_head_key(&k) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        sender.blocking_send(Err(e).generic_err()).ok();
+                        return;
+                    }
+                };
+
+                // Don't return for exact prefix match
+                if path
+                    .prefix_match(&prefix)
+                    .map(|mut x| x.next().is_some())
+                    .unwrap_or(false)
+                {
+                    let head = match Head::from_slice(&v) {
+                        Ok(head) => head,
+                        Err(e) => {
+                            sender.blocking_send(Err(e).generic_err()).ok();
+                            return;
+                        }
+                    };
+                    if sender.blocking_send(Ok(head.into_meta(path))).is_err() {
+                        return;
                     }
                 }
+            }
+        });
 
-                Result::<_, Error>::Ok(futures::stream::iter(metas))
-            })
-            .await?
-        })
-        .try_flatten()
-        .boxed()
+        ListStream { _task: task, rx }.boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
@@ -644,6 +685,38 @@ fn data_key(data_key_prefix: Slice, idx: u64) -> Slice {
     buf.put(data_key_prefix);
     buf.put_slice(&idx.to_be_bytes());
     buf.freeze().into()
+}
+
+struct GetStream {
+    _task: JoinSet<()>,
+    rx: Receiver<Result<Bytes>>,
+}
+
+impl Stream for GetStream {
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+struct ListStream {
+    _task: JoinSet<()>,
+    rx: Receiver<Result<ObjectMeta>>,
+}
+
+impl Stream for ListStream {
+    type Item = Result<ObjectMeta>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
 }
 
 #[cfg(test)]
