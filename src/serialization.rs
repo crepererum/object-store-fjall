@@ -38,7 +38,7 @@ impl Head {
         Ok(data.into())
     }
 
-    pub(crate) fn into_meta(&self, path: Path) -> ObjectMeta {
+    pub(crate) fn object_meta(&self, path: Path) -> ObjectMeta {
         let Head {
             last_modified,
             size,

@@ -219,7 +219,7 @@ impl ObjectStore for FjallStore {
             .write_transaction(move |tx, partitions| {
                 let existing = tx
                     .fetch_update(&partitions.head, head_key.clone(), |_| {
-                        Some(head_encoded.clone().into())
+                        Some(head_encoded.clone())
                     })
                     .generic_err()?;
 
@@ -282,7 +282,7 @@ impl ObjectStore for FjallStore {
                 });
             };
             let head = Head::from_slice(&head)?;
-            let meta = head.into_meta(location.clone());
+            let meta = head.object_meta(location.clone());
             options.check_preconditions(&meta)?;
 
             let range = match options.range {
@@ -325,10 +325,10 @@ impl ObjectStore for FjallStore {
                         let v = Bytes::from(v);
                         let v_range = (range.start as usize).saturating_sub(pos)
                             ..(range.end as usize).saturating_sub(pos).min(v.len());
-                        if !v_range.is_empty() {
-                            if sender.blocking_send(Ok(v.slice(v_range))).is_err() {
-                                return;
-                            }
+                        if !v_range.is_empty()
+                            && sender.blocking_send(Ok(v.slice(v_range))).is_err()
+                        {
+                            return;
                         }
                         pos += v.len();
                     }
@@ -415,7 +415,7 @@ impl ObjectStore for FjallStore {
                             return;
                         }
                     };
-                    if sender.blocking_send(Ok(head.into_meta(path))).is_err() {
+                    if sender.blocking_send(Ok(head.object_meta(path))).is_err() {
                         return;
                     }
                 }
@@ -460,7 +460,7 @@ impl ObjectStore for FjallStore {
                     common_prefixes.insert(prefix.child(common_prefix));
                 } else {
                     drop(parts);
-                    objects.push(Head::from_slice(&v)?.into_meta(path));
+                    objects.push(Head::from_slice(&v)?.object_meta(path));
                 }
             }
 
@@ -498,7 +498,7 @@ impl ObjectStore for FjallStore {
 
                 let existing = tx
                     .fetch_update(&partitions.head, head_key_to.clone(), |_| {
-                        Some(head_to_encoded.clone().into())
+                        Some(head_to_encoded.clone())
                     })
                     .generic_err()?;
 
@@ -680,19 +680,19 @@ fn copy_data(
         .get(partition, data_base_from.clone())
         .generic_err()?
         .ok_or_else(|| string_err("attributes missing".to_owned()))?;
-    tx.insert(&partition, data_base_to.clone(), attrs);
+    tx.insert(partition, data_base_to.clone(), attrs);
 
     let data_key_prefix_from = data_key_prefix(data_base_from);
     let data_key_prefix_to = data_key_prefix(data_base_to);
 
     let to_copy = tx
-        .prefix(&partition, data_key_prefix_from)
+        .prefix(partition, data_key_prefix_from)
         .map(|res| res.map(|(_k, v)| v).generic_err())
         .collect::<Result<Vec<_>>>()?;
 
     for (idx, data) in to_copy.into_iter().enumerate() {
         let data_key = data_key(data_key_prefix_to.clone(), idx as u64);
-        tx.insert(&partition, data_key, data.clone());
+        tx.insert(partition, data_key, data.clone());
     }
 
     Ok(())
@@ -763,8 +763,6 @@ impl Stream for ListStream {
 
 #[cfg(test)]
 mod tests {
-    use std::u64;
-
     use super::*;
 
     #[test]
