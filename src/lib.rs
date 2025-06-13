@@ -14,12 +14,10 @@ use object_store::{
 use serialization::{Head, WrappedAttributes};
 use tokio::{sync::mpsc::Receiver, task::JoinSet};
 use uuid::Uuid;
-use vendored::{get_options::GetOptionsExt, get_range::GetRangeExt};
 
 mod constants;
 mod error;
 mod serialization;
-mod vendored;
 
 struct Partitions {
     head: TransactionalPartitionHandle,
