@@ -14,6 +14,14 @@ async fn copy_if_not_exists() {
 }
 
 #[tokio::test]
+async fn copy_rename_nonexistent_object() {
+    let path = tempfile::tempdir().unwrap();
+    let storage = FjallStore::open(path.path()).await.unwrap();
+
+    object_store::integration::copy_rename_nonexistent_object(&storage).await;
+}
+
+#[tokio::test]
 async fn get_nonexistent_object() {
     let path = tempfile::tempdir().unwrap();
     let storage = FjallStore::open(path.path()).await.unwrap();
