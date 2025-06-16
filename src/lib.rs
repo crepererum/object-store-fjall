@@ -9,7 +9,7 @@ use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTra
 use futures::{Stream, StreamExt, stream::BoxStream};
 use object_store::{
     Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UpdateVersion, path::Path,
 };
 use serialization::{Head, WrappedAttributes};
 use tokio::{sync::mpsc::Receiver, task::JoinSet};
@@ -228,8 +228,27 @@ impl ObjectStore for FjallStore {
                         });
                     }
                     (PutMode::Create, None) => (),
-                    (PutMode::Update(_), _) => {
-                        return Err(Error::NotImplemented);
+                    (PutMode::Update(UpdateVersion { e_tag, version }), Some(existing)) => {
+                        if version.is_some() {
+                            return Err(Error::Precondition {
+                                path: location.to_string(),
+                                source: "versions are not used".to_owned().into(),
+                            });
+                        }
+
+                        let existing_e_tag = existing.id.to_string();
+                        if e_tag.as_deref() != Some(existing_e_tag.as_str()) {
+                            return Err(Error::Precondition {
+                                path: location.to_string(),
+                                source: format!("current etag: {existing_e_tag}").into(),
+                            });
+                        }
+                    }
+                    (PutMode::Update(_), None) => {
+                        return Err(Error::Precondition {
+                            path: location.to_string(),
+                            source: "not found".to_owned().into(),
+                        });
                     }
                 }
 

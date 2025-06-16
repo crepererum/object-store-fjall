@@ -83,7 +83,7 @@ async fn put_opts() {
     let path = tempfile::tempdir().unwrap();
     let storage = FjallStore::open(path.path()).await.unwrap();
 
-    object_store::integration::put_opts(&storage, false).await;
+    object_store::integration::put_opts(&storage, true).await;
 }
 
 #[tokio::test]
