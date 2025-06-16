@@ -79,6 +79,14 @@ async fn put_get_delete_list() {
 }
 
 #[tokio::test]
+async fn put_opts() {
+    let path = tempfile::tempdir().unwrap();
+    let storage = FjallStore::open(path.path()).await.unwrap();
+
+    object_store::integration::put_opts(&storage, false).await;
+}
+
+#[tokio::test]
 async fn rename_and_copy() {
     let path = tempfile::tempdir().unwrap();
     let storage = FjallStore::open(path.path()).await.unwrap();

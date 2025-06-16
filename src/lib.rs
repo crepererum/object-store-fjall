@@ -196,11 +196,6 @@ impl ObjectStore for FjallStore {
             extensions: _,
         } = opts;
 
-        // TODO: implement these
-        if mode != PutMode::Overwrite {
-            return Err(Error::NotImplemented);
-        }
-
         let id = Uuid::now_v7();
 
         let head_key = head_key(location);
@@ -212,6 +207,7 @@ impl ObjectStore for FjallStore {
         let head_encoded = head.to_slice()?;
         let data_base = data_base(head.id);
         let data_key_prefix = data_key_prefix(data_base.clone());
+        let location = location.clone();
 
         self.handles
             .write_transaction(move |tx, partitions| {
@@ -219,10 +215,25 @@ impl ObjectStore for FjallStore {
                     .fetch_update(&partitions.head, head_key.clone(), |_| {
                         Some(head_encoded.clone())
                     })
-                    .generic_err()?;
+                    .generic_err()?
+                    .map(|head| Head::from_slice(&head))
+                    .transpose()?;
+
+                match (&mode, existing.as_ref()) {
+                    (PutMode::Overwrite, _) => (),
+                    (PutMode::Create, Some(_)) => {
+                        return Err(Error::AlreadyExists {
+                            path: location.to_string(),
+                            source: "already exists".to_owned().into(),
+                        });
+                    }
+                    (PutMode::Create, None) => (),
+                    (PutMode::Update(_), _) => {
+                        return Err(Error::NotImplemented);
+                    }
+                }
 
                 if let Some(head) = existing {
-                    let head = Head::from_slice(&head)?;
                     clear_data(tx, &partitions.data, head.id)?;
                 }
 
