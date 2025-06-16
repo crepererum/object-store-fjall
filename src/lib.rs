@@ -9,7 +9,7 @@ use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTra
 use futures::{Stream, StreamExt, stream::BoxStream};
 use object_store::{
     Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UpdateVersion, path::Path,
 };
 use serialization::{Head, WrappedAttributes};
 use tokio::{sync::mpsc::Receiver, task::JoinSet};
@@ -196,11 +196,6 @@ impl ObjectStore for FjallStore {
             extensions: _,
         } = opts;
 
-        // TODO: implement these
-        if mode != PutMode::Overwrite {
-            return Err(Error::NotImplemented);
-        }
-
         let id = Uuid::now_v7();
 
         let head_key = head_key(location);
@@ -212,6 +207,7 @@ impl ObjectStore for FjallStore {
         let head_encoded = head.to_slice()?;
         let data_base = data_base(head.id);
         let data_key_prefix = data_key_prefix(data_base.clone());
+        let location = location.clone();
 
         self.handles
             .write_transaction(move |tx, partitions| {
@@ -219,10 +215,44 @@ impl ObjectStore for FjallStore {
                     .fetch_update(&partitions.head, head_key.clone(), |_| {
                         Some(head_encoded.clone())
                     })
-                    .generic_err()?;
+                    .generic_err()?
+                    .map(|head| Head::from_slice(&head))
+                    .transpose()?;
+
+                match (&mode, existing.as_ref()) {
+                    (PutMode::Overwrite, _) => (),
+                    (PutMode::Create, Some(_)) => {
+                        return Err(Error::AlreadyExists {
+                            path: location.to_string(),
+                            source: "already exists".to_owned().into(),
+                        });
+                    }
+                    (PutMode::Create, None) => (),
+                    (PutMode::Update(UpdateVersion { e_tag, version }), Some(existing)) => {
+                        if version.is_some() {
+                            return Err(Error::Precondition {
+                                path: location.to_string(),
+                                source: "versions are not used".to_owned().into(),
+                            });
+                        }
+
+                        let existing_e_tag = existing.id.to_string();
+                        if e_tag.as_deref() != Some(existing_e_tag.as_str()) {
+                            return Err(Error::Precondition {
+                                path: location.to_string(),
+                                source: format!("current etag: {existing_e_tag}").into(),
+                            });
+                        }
+                    }
+                    (PutMode::Update(_), None) => {
+                        return Err(Error::Precondition {
+                            path: location.to_string(),
+                            source: "not found".to_owned().into(),
+                        });
+                    }
+                }
 
                 if let Some(head) = existing {
-                    let head = Head::from_slice(&head)?;
                     clear_data(tx, &partitions.data, head.id)?;
                 }
 

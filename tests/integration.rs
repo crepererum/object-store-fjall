@@ -14,7 +14,15 @@ async fn copy_if_not_exists() {
 }
 
 #[tokio::test]
-async fn get_nonexistent_location() {
+async fn copy_rename_nonexistent_object() {
+    let path = tempfile::tempdir().unwrap();
+    let storage = FjallStore::open(path.path()).await.unwrap();
+
+    object_store::integration::copy_rename_nonexistent_object(&storage).await;
+}
+
+#[tokio::test]
+async fn get_nonexistent_object() {
     let path = tempfile::tempdir().unwrap();
     let storage = FjallStore::open(path.path()).await.unwrap();
 
@@ -68,6 +76,14 @@ async fn put_get_delete_list() {
     let storage = FjallStore::open(path.path()).await.unwrap();
 
     object_store::integration::put_get_delete_list(&storage).await;
+}
+
+#[tokio::test]
+async fn put_opts() {
+    let path = tempfile::tempdir().unwrap();
+    let storage = FjallStore::open(path.path()).await.unwrap();
+
+    object_store::integration::put_opts(&storage, true).await;
 }
 
 #[tokio::test]
