@@ -14,7 +14,7 @@ async fn copy_if_not_exists() {
 }
 
 #[tokio::test]
-async fn get_nonexistent_location() {
+async fn get_nonexistent_object() {
     let path = tempfile::tempdir().unwrap();
     let storage = FjallStore::open(path.path()).await.unwrap();
 
