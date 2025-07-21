@@ -9,7 +9,7 @@ use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTra
 use futures::{Stream, StreamExt, stream::BoxStream};
 use object_store::{
     Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UpdateVersion, path::Path,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UpdateVersion, path::Path,
 };
 use serialization::{Head, WrappedAttributes};
 use tokio::{sync::mpsc::Receiver, task::JoinSet};
@@ -286,7 +286,7 @@ impl ObjectStore for FjallStore {
     async fn put_multipart_opts(
         &self,
         _location: &Path,
-        _opts: PutMultipartOpts,
+        _opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         Err(Error::NotImplemented)
     }
