@@ -1,17 +1,19 @@
-use bincode::{Decode, Encode};
+use std::{borrow::Cow, marker::PhantomData};
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use fjall::Slice;
 use object_store::{Attribute, AttributeValue, Attributes, ObjectMeta, Result, path::Path};
+use serde::{
+    Deserialize, Serialize,
+    de::{MapAccess, Visitor},
+    ser::{Error, SerializeMap},
+};
 use uuid::Uuid;
 
-use crate::error::string_err;
+use crate::error::{GenericResultExt, string_err};
 
-const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard()
-    .with_little_endian()
-    .with_variable_int_encoding()
-    .with_no_limit();
-
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Head {
     pub(crate) last_modified: DateTime<Utc>,
     pub(crate) size: u64,
@@ -20,21 +22,15 @@ pub(crate) struct Head {
 
 impl Head {
     pub(crate) fn from_slice(s: &[u8]) -> Result<Self> {
-        let (this, read) = bincode::decode_from_slice(s, BINCODE_CONFIG).map_err(|e| {
-            // why do they not implement std::error::Error?!
-            string_err(e.to_string())
-        })?;
-        if read != s.len() {
-            return Err(string_err(format!("trailing bytes: {}", s.len() - read)));
+        let (this, remaining) = postcard::take_from_bytes(s).generic_err()?;
+        if !remaining.is_empty() {
+            return Err(string_err(format!("trailing bytes: {}", remaining.len())));
         }
         Ok(this)
     }
 
     pub(crate) fn to_slice(&self) -> Result<Slice> {
-        let data = Bytes::from(bincode::encode_to_vec(self, BINCODE_CONFIG).map_err(|e| {
-            // why do they not implement std::error::Error?!
-            string_err(e.to_string())
-        })?);
+        let data = Bytes::from(postcard::to_stdvec(self).generic_err()?);
         Ok(data.into())
     }
 
@@ -55,109 +51,20 @@ impl Head {
     }
 }
 
-impl Encode for Head {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
-        self.last_modified.timestamp().encode(encoder)?;
-        self.last_modified
-            .timestamp_subsec_nanos()
-            .encode(encoder)?;
-
-        self.size.encode(encoder)?;
-
-        self.id.as_u128().encode(encoder)?;
-
-        Ok(())
-    }
-}
-
-impl<Context> Decode<Context> for Head {
-    fn decode<D: bincode::de::Decoder<Context = Context>>(
-        decoder: &mut D,
-    ) -> std::result::Result<Self, bincode::error::DecodeError> {
-        Ok(Self {
-            last_modified: DateTime::from_timestamp(
-                Decode::decode(decoder)?,
-                Decode::decode(decoder)?,
-            )
-            .ok_or(bincode::error::DecodeError::Other("invalid timestamp"))?,
-            size: Decode::decode(decoder)?,
-            id: Uuid::from_u128(Decode::decode(decoder)?),
-        })
-    }
-}
-
 pub(crate) struct WrappedAttributes(Attributes);
 
 impl WrappedAttributes {
     pub(crate) fn from_slice(s: &[u8]) -> Result<Self> {
-        let (this, read) = bincode::decode_from_slice(s, BINCODE_CONFIG).map_err(|e| {
-            // why do they not implement std::error::Error?!
-            string_err(e.to_string())
-        })?;
-        if read != s.len() {
-            return Err(string_err(format!("trailing bytes: {}", s.len() - read)));
+        let (this, remaining) = postcard::take_from_bytes(s).generic_err()?;
+        if !remaining.is_empty() {
+            return Err(string_err(format!("trailing bytes: {}", remaining.len())));
         }
         Ok(this)
     }
 
     pub(crate) fn to_slice(&self) -> Result<Slice> {
-        let data = Bytes::from(bincode::encode_to_vec(self, BINCODE_CONFIG).map_err(|e| {
-            // why do they not implement std::error::Error?!
-            string_err(e.to_string())
-        })?);
+        let data = Bytes::from(postcard::to_stdvec(self).generic_err()?);
         Ok(data.into())
-    }
-
-    fn encode_key<E: bincode::enc::Encoder>(
-        key: &Attribute,
-        encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
-        match key {
-            Attribute::ContentDisposition => 0u8.encode(encoder),
-            Attribute::ContentEncoding => 1u8.encode(encoder),
-            Attribute::ContentLanguage => 2u8.encode(encoder),
-            Attribute::ContentType => 3u8.encode(encoder),
-            Attribute::CacheControl => 4u8.encode(encoder),
-            Attribute::Metadata(cow) => {
-                5u8.encode(encoder)?;
-                cow.as_bytes().encode(encoder)
-            }
-            _ => Err(bincode::error::EncodeError::OtherString(format!(
-                "cannot encode attribute: {key:?}"
-            ))),
-        }
-    }
-
-    fn decode_key<Context, D: bincode::de::Decoder<Context = Context>>(
-        decoder: &mut D,
-    ) -> std::result::Result<Attribute, bincode::error::DecodeError> {
-        match u8::decode(decoder)? {
-            0 => Ok(Attribute::ContentDisposition),
-            1 => Ok(Attribute::ContentEncoding),
-            2 => Ok(Attribute::ContentLanguage),
-            3 => Ok(Attribute::ContentType),
-            4 => Ok(Attribute::CacheControl),
-            5 => Ok(Attribute::Metadata(String::decode(decoder)?.into())),
-            o => Err(bincode::error::DecodeError::OtherString(format!(
-                "cannot decode attribute: {o:?}"
-            ))),
-        }
-    }
-
-    fn encode_value<E: bincode::enc::Encoder>(
-        value: &AttributeValue,
-        encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
-        value.as_bytes().encode(encoder)
-    }
-
-    fn decode_value<Context, D: bincode::de::Decoder<Context = Context>>(
-        decoder: &mut D,
-    ) -> std::result::Result<AttributeValue, bincode::error::DecodeError> {
-        Ok(String::decode(decoder)?.into())
     }
 }
 
@@ -173,35 +80,118 @@ impl From<WrappedAttributes> for Attributes {
     }
 }
 
-impl Encode for WrappedAttributes {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
-        (self.0.len() as u64).encode(encoder)?;
+impl Serialize for WrappedAttributes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
 
         for (k, v) in &self.0 {
-            Self::encode_key(k, encoder)?;
-            Self::encode_value(v, encoder)?;
+            map.serialize_entry(
+                &WrappedAttribute::try_from(k).map_err(S::Error::custom)?,
+                &WrappedAttributeValue::from(v),
+            )?;
         }
 
-        Ok(())
+        map.end()
     }
 }
 
-impl<Context> Decode<Context> for WrappedAttributes {
-    fn decode<D: bincode::de::Decoder<Context = Context>>(
-        decoder: &mut D,
-    ) -> std::result::Result<Self, bincode::error::DecodeError> {
-        let len = u64::decode(decoder)? as usize;
-        let mut attrs = Attributes::with_capacity(len);
+impl<'de> Deserialize<'de> for WrappedAttributes {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(AttributesVisitor::new())
+    }
+}
 
-        for _ in 0..len {
-            let k = Self::decode_key(decoder)?;
-            let v = Self::decode_value(decoder)?;
-            attrs.insert(k, v);
+struct AttributesVisitor {
+    marker: PhantomData<fn() -> Attributes>,
+}
+
+impl AttributesVisitor {
+    fn new() -> Self {
+        Self {
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'de> Visitor<'de> for AttributesVisitor {
+    type Value = WrappedAttributes;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("Attributes")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut attrs = Attributes::with_capacity(access.size_hint().unwrap_or(0));
+
+        while let Some((key, value)) =
+            access.next_entry::<WrappedAttribute, WrappedAttributeValue>()?
+        {
+            attrs.insert(key.into(), value.into());
         }
 
-        Ok(Self(attrs))
+        Ok(WrappedAttributes(attrs))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum WrappedAttribute<'a> {
+    ContentDisposition,
+    ContentEncoding,
+    ContentLanguage,
+    ContentType,
+    CacheControl,
+    Metadata(Cow<'a, str>),
+}
+
+impl<'a> TryFrom<&'a Attribute> for WrappedAttribute<'a> {
+    type Error = String;
+
+    fn try_from(attr: &'a Attribute) -> Result<Self, Self::Error> {
+        match attr {
+            Attribute::ContentDisposition => Ok(Self::ContentDisposition),
+            Attribute::ContentEncoding => Ok(Self::ContentEncoding),
+            Attribute::ContentLanguage => Ok(Self::ContentLanguage),
+            Attribute::ContentType => Ok(Self::ContentType),
+            Attribute::CacheControl => Ok(Self::CacheControl),
+            Attribute::Metadata(md) => Ok(Self::Metadata(md.as_ref().into())),
+            other => Err(format!("cannot encode attribute {other:?}")),
+        }
+    }
+}
+
+impl<'a> From<WrappedAttribute<'a>> for Attribute {
+    fn from(attr: WrappedAttribute<'a>) -> Self {
+        match attr {
+            WrappedAttribute::ContentDisposition => Self::ContentDisposition,
+            WrappedAttribute::ContentEncoding => Self::ContentEncoding,
+            WrappedAttribute::ContentLanguage => Self::ContentLanguage,
+            WrappedAttribute::ContentType => Self::ContentType,
+            WrappedAttribute::CacheControl => Self::CacheControl,
+            WrappedAttribute::Metadata(md) => Self::Metadata(md.into_owned().into()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WrappedAttributeValue<'a>(Cow<'a, str>);
+
+impl<'a> From<&'a AttributeValue> for WrappedAttributeValue<'a> {
+    fn from(value: &'a AttributeValue) -> Self {
+        Self(value.as_ref().into())
+    }
+}
+
+impl<'a> From<WrappedAttributeValue<'a>> for AttributeValue {
+    fn from(value: WrappedAttributeValue<'a>) -> Self {
+        value.0.into_owned().into()
     }
 }
