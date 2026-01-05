@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{GetOptions, ObjectStore, path::Path};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt, path::Path};
 use object_store_fjall::FjallStore;
 
 #[tokio::test]

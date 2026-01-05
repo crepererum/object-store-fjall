@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{DynObjectStore, ObjectStore, PutPayload, path::Path};
+use object_store::{DynObjectStore, ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use object_store_fjall::FjallStore;
 
 #[tokio::test]

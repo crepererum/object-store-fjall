@@ -6,10 +6,11 @@ use chrono::Utc;
 use constants::STORE;
 use error::{GenericResultExt, string_err};
 use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTransaction};
-use futures::{Stream, StreamExt, stream::BoxStream};
+use futures::{Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{
-    Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UpdateVersion, path::Path,
+    CopyMode, CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    RenameTargetMode, Result, UpdateVersion, path::Path,
 };
 use serialization::{Head, WrappedAttributes};
 use tokio::{sync::mpsc::Receiver, task::JoinSet};
@@ -288,7 +289,10 @@ impl ObjectStore for FjallStore {
         _location: &Path,
         _opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        Err(Error::NotImplemented)
+        Err(Error::NotImplemented {
+            operation: "put_multipart_opts".to_owned(),
+            implementer: STORE.to_owned(),
+        })
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -377,23 +381,38 @@ impl ObjectStore for FjallStore {
         .await?
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let head_key = head_key(location);
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let handles = Arc::clone(&self.handles);
 
-        self.handles
-            .write_transaction(move |tx, partitions| {
-                let existing = tx
-                    .fetch_update(&partitions.head, head_key.clone(), |_| None)
-                    .generic_err()?;
+        locations
+            .and_then(move |location| {
+                let handles = Arc::clone(&handles);
 
-                if let Some(head) = existing {
-                    let head = Head::from_slice(&head)?;
-                    clear_data(tx, &partitions.data, head.id)?;
+                async move {
+                    let head_key = head_key(&location);
+
+                    handles
+                        .write_transaction(move |tx, partitions| {
+                            let existing = tx
+                                .fetch_update(&partitions.head, head_key.clone(), |_| None)
+                                .generic_err()?;
+
+                            if let Some(head) = existing {
+                                let head = Head::from_slice(&head)?;
+                                clear_data(tx, &partitions.data, head.id)?;
+                            }
+
+                            Ok(())
+                        })
+                        .await?;
+
+                    Ok(location)
                 }
-
-                Ok(())
             })
-            .await
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -500,160 +519,170 @@ impl ObjectStore for FjallStore {
         .await?
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        let head_key_from = head_key(from);
-        let head_key_to = head_key(to);
-        let from = from.clone();
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> Result<()> {
+        let CopyOptions {
+            mode,
+            // ignore extensions
+            extensions: _,
+        } = opts;
 
-        self.handles
-            .write_transaction(move |tx, partitions| {
-                let Some(head_from) = tx
-                    .get(&partitions.head, head_key_from.clone())
-                    .generic_err()?
-                else {
-                    return Err(Error::NotFound {
-                        path: from.to_string(),
-                        source: "not found".to_owned().into(),
-                    });
-                };
-                let head_from = Head::from_slice(&head_from)?;
-
-                let head_to = Head {
-                    id: Uuid::now_v7(),
-                    ..head_from
-                };
-                let head_to_encoded = head_to.to_slice()?;
-
-                let existing = tx
-                    .fetch_update(&partitions.head, head_key_to.clone(), |_| {
-                        Some(head_to_encoded.clone())
-                    })
-                    .generic_err()?;
-
-                if let Some(head) = existing {
-                    let head = Head::from_slice(&head)?;
-                    clear_data(tx, &partitions.data, head.id)?;
-                }
-
-                copy_data(tx, &partitions.data, head_from.id, head_to.id)?;
-
-                Ok(())
-            })
-            .await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        let head_key_from = head_key(from);
-        let head_key_to = head_key(to);
-        let from = from.clone();
-
-        self.handles
-            .write_transaction(move |tx, partitions| {
-                let Some(head) = tx
-                    .fetch_update(&partitions.head, head_key_from.clone(), |_| None)
-                    .generic_err()?
-                else {
-                    return Err(Error::NotFound {
-                        path: from.to_string(),
-                        source: "not found".to_owned().into(),
-                    });
-                };
-
-                let existing = tx
-                    .fetch_update(&partitions.head, head_key_to.clone(), |_| {
-                        Some(head.clone())
-                    })
-                    .generic_err()?;
-
-                if let Some(head) = existing {
-                    let head = Head::from_slice(&head)?;
-                    clear_data(tx, &partitions.data, head.id)?;
-                }
-
-                Ok(())
-            })
-            .await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
         let head_key_from = head_key(from);
         let head_key_to = head_key(to);
         let from = from.clone();
         let to = to.clone();
 
-        self.handles
-            .write_transaction(move |tx, partitions| {
-                let Some(head_from) = tx
-                    .get(&partitions.head, head_key_from.clone())
-                    .generic_err()?
-                else {
-                    return Err(Error::NotFound {
-                        path: from.to_string(),
-                        source: "not found".to_owned().into(),
-                    });
-                };
-                let head_from = Head::from_slice(&head_from)?;
+        match mode {
+            CopyMode::Overwrite => {
+                self.handles
+                    .write_transaction(move |tx, partitions| {
+                        let Some(head_from) = tx
+                            .get(&partitions.head, head_key_from.clone())
+                            .generic_err()?
+                        else {
+                            return Err(Error::NotFound {
+                                path: from.to_string(),
+                                source: "not found".to_owned().into(),
+                            });
+                        };
+                        let head_from = Head::from_slice(&head_from)?;
 
-                let head_to = Head {
-                    id: Uuid::now_v7(),
-                    ..head_from
-                };
-                let head_to_encoded = head_to.to_slice()?;
+                        let head_to = Head {
+                            id: Uuid::now_v7(),
+                            ..head_from
+                        };
+                        let head_to_encoded = head_to.to_slice()?;
 
-                let existing = tx
-                    .fetch_update(&partitions.head, head_key_to.clone(), |v| {
-                        Some(v.cloned().unwrap_or_else(|| head_to_encoded.clone()))
+                        let existing = tx
+                            .fetch_update(&partitions.head, head_key_to.clone(), |_| {
+                                Some(head_to_encoded.clone())
+                            })
+                            .generic_err()?;
+
+                        if let Some(head) = existing {
+                            let head = Head::from_slice(&head)?;
+                            clear_data(tx, &partitions.data, head.id)?;
+                        }
+
+                        copy_data(tx, &partitions.data, head_from.id, head_to.id)?;
+
+                        Ok(())
                     })
-                    .generic_err()?;
+                    .await
+            }
+            CopyMode::Create => {
+                self.handles
+                    .write_transaction(move |tx, partitions| {
+                        let Some(head_from) = tx
+                            .get(&partitions.head, head_key_from.clone())
+                            .generic_err()?
+                        else {
+                            return Err(Error::NotFound {
+                                path: from.to_string(),
+                                source: "not found".to_owned().into(),
+                            });
+                        };
+                        let head_from = Head::from_slice(&head_from)?;
 
-                if existing.is_some() {
-                    return Err(Error::AlreadyExists {
-                        path: to.to_string(),
-                        source: "already exists".into(),
-                    });
-                }
+                        let head_to = Head {
+                            id: Uuid::now_v7(),
+                            ..head_from
+                        };
+                        let head_to_encoded = head_to.to_slice()?;
 
-                copy_data(tx, &partitions.data, head_from.id, head_to.id)?;
+                        let existing = tx
+                            .fetch_update(&partitions.head, head_key_to.clone(), |v| {
+                                Some(v.cloned().unwrap_or_else(|| head_to_encoded.clone()))
+                            })
+                            .generic_err()?;
 
-                Ok(())
-            })
-            .await
+                        if existing.is_some() {
+                            return Err(Error::AlreadyExists {
+                                path: to.to_string(),
+                                source: "already exists".into(),
+                            });
+                        }
+
+                        copy_data(tx, &partitions.data, head_from.id, head_to.id)?;
+
+                        Ok(())
+                    })
+                    .await
+            }
+        }
     }
 
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
+        let RenameOptions {
+            target_mode,
+            // ignore extensions
+            extensions: _,
+        } = opts;
+
         let head_key_from = head_key(from);
         let head_key_to = head_key(to);
         let from = from.clone();
         let to = to.clone();
 
-        self.handles
-            .write_transaction(move |tx, partitions| {
-                let Some(head) = tx
-                    .fetch_update(&partitions.head, head_key_from.clone(), |_| None)
-                    .generic_err()?
-                else {
-                    return Err(Error::NotFound {
-                        path: from.to_string(),
-                        source: "not found".to_owned().into(),
-                    });
-                };
+        match target_mode {
+            RenameTargetMode::Overwrite => {
+                self.handles
+                    .write_transaction(move |tx, partitions| {
+                        let Some(head) = tx
+                            .fetch_update(&partitions.head, head_key_from.clone(), |_| None)
+                            .generic_err()?
+                        else {
+                            return Err(Error::NotFound {
+                                path: from.to_string(),
+                                source: "not found".to_owned().into(),
+                            });
+                        };
 
-                let existing = tx
-                    .fetch_update(&partitions.head, head_key_to.clone(), |_| {
-                        Some(head.clone())
+                        let existing = tx
+                            .fetch_update(&partitions.head, head_key_to.clone(), |_| {
+                                Some(head.clone())
+                            })
+                            .generic_err()?;
+
+                        if let Some(head) = existing {
+                            let head = Head::from_slice(&head)?;
+                            clear_data(tx, &partitions.data, head.id)?;
+                        }
+
+                        Ok(())
                     })
-                    .generic_err()?;
+                    .await
+            }
+            RenameTargetMode::Create => {
+                self.handles
+                    .write_transaction(move |tx, partitions| {
+                        let Some(head) = tx
+                            .fetch_update(&partitions.head, head_key_from.clone(), |_| None)
+                            .generic_err()?
+                        else {
+                            return Err(Error::NotFound {
+                                path: from.to_string(),
+                                source: "not found".to_owned().into(),
+                            });
+                        };
 
-                if existing.is_some() {
-                    return Err(Error::AlreadyExists {
-                        path: to.to_string(),
-                        source: "already exists".into(),
-                    });
-                }
+                        let existing = tx
+                            .fetch_update(&partitions.head, head_key_to.clone(), |_| {
+                                Some(head.clone())
+                            })
+                            .generic_err()?;
 
-                Ok(())
-            })
-            .await
+                        if existing.is_some() {
+                            return Err(Error::AlreadyExists {
+                                path: to.to_string(),
+                                source: "already exists".into(),
+                            });
+                        }
+
+                        Ok(())
+                    })
+                    .await
+            }
+        }
     }
 }
 
