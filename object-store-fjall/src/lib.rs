@@ -317,7 +317,7 @@ impl ObjectStore for FjallStore {
                 });
             };
             let head = Head::from_slice(&head)?;
-            let meta = head.object_meta(location.clone());
+            let meta = head.object_meta(location);
             options.check_preconditions(&meta)?;
 
             let range = match options.range {
@@ -647,7 +647,7 @@ where
 }
 
 fn path_from_head_key(key: &[u8]) -> Result<Path> {
-    let path = String::from_utf8(key.to_owned()).generic_err()?;
+    let path = str::from_utf8(key).generic_err()?;
     let path = Path::parse(path)?;
     Ok(path)
 }
