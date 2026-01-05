@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait = "0.1.88"
-bincode = { version = "2.0.1", default-features = false, features = ["alloc"] }
+bincode = { version = "3.0.0", default-features = false, features = ["alloc"] }
 bytes = "1.10.1"
 chrono = { version = "0.4.40", default-features = false }
 fjall = {version = "2.8.0", default-features = false, features = ["bytes", "ssi_tx"] }
