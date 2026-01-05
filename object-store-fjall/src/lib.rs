@@ -5,7 +5,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Utc;
 use constants::STORE;
 use error::{GenericResultExt, string_err};
-use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle, WriteTransaction};
+use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx, Readable, Slice};
 use futures::{Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{
     CopyMode, CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
@@ -20,20 +20,20 @@ mod constants;
 mod error;
 mod serialization;
 
-struct Partitions {
-    head: TransactionalPartitionHandle,
-    data: TransactionalPartitionHandle,
+struct Keyspaces {
+    head: OptimisticTxKeyspace,
+    data: OptimisticTxKeyspace,
 }
 
 struct Handles {
-    keyspace: TransactionalKeyspace,
-    partitions: Partitions,
+    database: OptimisticTxDatabase,
+    keyspaces: Keyspaces,
 }
 
 impl Handles {
     async fn write_transaction<F>(self: &Arc<Self>, f: F) -> Result<()>
     where
-        F: for<'a> Fn(&'a mut WriteTransaction, &'a Partitions) -> Result<()> + Send + 'static,
+        F: for<'a> Fn(&'a mut OptimisticWriteTx, &'a Keyspaces) -> Result<()> + Send + 'static,
     {
         let mut f = f;
 
@@ -42,17 +42,17 @@ impl Handles {
 
             let (done, f_back) = spawn_blocking(move || {
                 let Self {
-                    keyspace,
-                    partitions,
+                    database,
+                    keyspaces: partitions,
                 } = this.as_ref();
 
-                let mut tx = keyspace.write_tx().generic_err()?;
+                let mut tx = database.write_tx().generic_err()?;
 
                 f(&mut tx, partitions)?;
 
                 match tx.commit().generic_err()? {
                     Ok(()) => {
-                        keyspace
+                        database
                             .persist(fjall::PersistMode::SyncAll)
                             .generic_err()?;
 
@@ -106,37 +106,40 @@ impl FjallStore {
     where
         P: AsRef<std::path::Path>,
     {
-        let config = fjall::Config::new(path)
+        let builder = OptimisticTxDatabase::builder(path)
             .manual_journal_persist(true)
-            .max_write_buffer_size(128 * 1024 * 1024);
+            .max_write_buffer_size(Some(128 * 1024 * 1024));
 
         let handles = spawn_blocking(move || {
-            let keyspace = TransactionalKeyspace::open(config).generic_err()?;
+            let database = builder.open().generic_err()?;
 
-            let head = keyspace
-                .open_partition(
-                    "head",
-                    fjall::PartitionCreateOptions::default()
-                        .compression(fjall::CompressionType::None)
-                        .manual_journal_persist(true),
-                )
+            let head = database
+                .keyspace("head", || {
+                    fjall::KeyspaceCreateOptions::default()
+                        .manual_journal_persist(true)
+                        .with_kv_separation(Some(
+                            fjall::KvSeparationOptions::default()
+                                .compression(fjall::CompressionType::None),
+                        ))
+                })
                 .generic_err()?;
 
-            let data = keyspace
-                .open_partition(
-                    "data",
-                    fjall::PartitionCreateOptions::default()
-                        .bloom_filter_bits(None)
-                        .compression(fjall::CompressionType::None)
+            let data = database
+                .keyspace("data", || {
+                    fjall::KeyspaceCreateOptions::default()
+                        .filter_policy(fjall::config::FilterPolicy::disabled())
                         .manual_journal_persist(true)
                         .max_memtable_size(64 * 1024 * 1024)
-                        .with_kv_separation(fjall::KvSeparationOptions::default()),
-                )
+                        .with_kv_separation(Some(
+                            fjall::KvSeparationOptions::default()
+                                .compression(fjall::CompressionType::None),
+                        ))
+                })
                 .generic_err()?;
 
             Result::<_, Error>::Ok(Handles {
-                keyspace,
-                partitions: Partitions { head, data },
+                database,
+                keyspaces: Keyspaces { head, data },
             })
         })
         .await??;
@@ -150,10 +153,10 @@ impl FjallStore {
         let handles = Arc::clone(&self.handles);
         spawn_blocking(move || {
             let Handles {
-                keyspace: _,
-                partitions,
+                database: _,
+                keyspaces,
             } = handles.as_ref();
-            let Partitions { head, data } = partitions;
+            let Keyspaces { head, data } = keyspaces;
 
             let head = head.inner();
             let head_len = head.len().generic_err()?;
@@ -301,13 +304,13 @@ impl ObjectStore for FjallStore {
         let head_key = head_key(&location);
         spawn_blocking(move || {
             let Handles {
-                keyspace,
-                partitions,
+                database,
+                keyspaces,
             } = handles.as_ref();
 
-            let tx = keyspace.read_tx();
+            let tx = database.read_tx();
 
-            let Some(head) = tx.get(&partitions.head, head_key).generic_err()? else {
+            let Some(head) = tx.get(&keyspaces.head, head_key).generic_err()? else {
                 return Err(Error::NotFound {
                     path: location.to_string(),
                     source: "not found".to_owned().into(),
@@ -324,7 +327,7 @@ impl ObjectStore for FjallStore {
 
             let data_base = data_base(head.id);
             let attributes = WrappedAttributes::from_slice(
-                tx.get(&partitions.data, data_base.clone())
+                tx.get(&keyspaces.data, data_base.clone())
                     .generic_err()?
                     .ok_or_else(|| string_err("attributes missing".to_owned()))?
                     .as_ref(),
@@ -339,14 +342,14 @@ impl ObjectStore for FjallStore {
                 let mut task = JoinSet::new();
                 task.spawn_blocking(move || {
                     let Handles {
-                        keyspace: _,
-                        partitions,
+                        database: _,
+                        keyspaces,
                     } = handles.as_ref();
 
                     let mut pos = 0usize;
                     let data_key_prefix = data_key_prefix(data_base);
-                    for kv_res in tx.prefix(&partitions.data, data_key_prefix) {
-                        let v = match kv_res {
+                    for guard in tx.prefix(&keyspaces.data, data_key_prefix) {
+                        let v = match guard.into_inner() {
                             Ok((_k, v)) => v,
                             Err(e) => {
                                 sender.blocking_send(Err(e).generic_err()).ok();
@@ -427,14 +430,14 @@ impl ObjectStore for FjallStore {
 
         task.spawn_blocking(move || {
             let Handles {
-                keyspace,
-                partitions,
+                database,
+                keyspaces,
             } = handles.as_ref();
 
-            let tx = keyspace.read_tx();
+            let tx = database.read_tx();
 
-            for kv_res in tx.prefix(&partitions.head, head_key_prefix) {
-                let (k, v) = match kv_res {
+            for guard in tx.prefix(&keyspaces.head, head_key_prefix) {
+                let (k, v) = match guard.into_inner() {
                     Ok((k, v)) => (k, v),
                     Err(e) => {
                         sender.blocking_send(Err(e).generic_err()).ok();
@@ -479,16 +482,16 @@ impl ObjectStore for FjallStore {
 
         spawn_blocking(move || {
             let Handles {
-                keyspace,
-                partitions,
+                database,
+                keyspaces,
             } = handles.as_ref();
 
-            let tx = keyspace.read_tx();
+            let tx = database.read_tx();
 
             let mut common_prefixes = BTreeSet::new();
             let mut objects = vec![];
-            for kv_res in tx.prefix(&partitions.head, head_key_prefix) {
-                let (k, v) = kv_res.generic_err()?;
+            for guard in tx.prefix(&keyspaces.head, head_key_prefix) {
+                let (k, v) = guard.into_inner().generic_err()?;
                 let path = path_from_head_key(&k)?;
 
                 let mut parts = match path.prefix_match(&prefix) {
@@ -650,29 +653,25 @@ fn path_from_head_key(key: &[u8]) -> Result<Path> {
 /// Scan + delete.
 ///
 /// See <https://github.com/fjall-rs/fjall/issues/33>.
-fn clear_data(
-    tx: &mut WriteTransaction,
-    partition: &TransactionalPartitionHandle,
-    id: Uuid,
-) -> Result<()> {
+fn clear_data(tx: &mut OptimisticWriteTx, keyspace: &OptimisticTxKeyspace, id: Uuid) -> Result<()> {
     let data_base = data_base(id);
-    tx.remove(partition, data_base.clone());
+    tx.remove(keyspace, data_base.clone());
 
     let to_delete = tx
-        .prefix(partition, data_key_prefix(data_base))
-        .map(|res| res.map(|(k, _v)| k).generic_err())
+        .prefix(keyspace, data_key_prefix(data_base))
+        .map(|guard| guard.into_inner().map(|(k, _v)| k).generic_err())
         .collect::<Result<Vec<_>>>()?;
 
     for k in to_delete {
-        tx.remove(partition, k);
+        tx.remove(keyspace, k);
     }
 
     Ok(())
 }
 
 fn copy_data(
-    tx: &mut WriteTransaction,
-    partition: &TransactionalPartitionHandle,
+    tx: &mut OptimisticWriteTx,
+    keyspace: &OptimisticTxKeyspace,
     id_from: Uuid,
     id_to: Uuid,
 ) -> Result<()> {
@@ -681,22 +680,22 @@ fn copy_data(
 
     // attributes
     let attrs = tx
-        .get(partition, data_base_from.clone())
+        .get(keyspace, data_base_from.clone())
         .generic_err()?
         .ok_or_else(|| string_err("attributes missing".to_owned()))?;
-    tx.insert(partition, data_base_to.clone(), attrs);
+    tx.insert(keyspace, data_base_to.clone(), attrs);
 
     let data_key_prefix_from = data_key_prefix(data_base_from);
     let data_key_prefix_to = data_key_prefix(data_base_to);
 
     let to_copy = tx
-        .prefix(partition, data_key_prefix_from)
-        .map(|res| res.map(|(_k, v)| v).generic_err())
+        .prefix(keyspace, data_key_prefix_from)
+        .map(|guard| guard.into_inner().map(|(_k, v)| v).generic_err())
         .collect::<Result<Vec<_>>>()?;
 
     for (idx, data) in to_copy.into_iter().enumerate() {
         let data_key = data_key(data_key_prefix_to.clone(), idx as u64);
-        tx.insert(partition, data_key, data.clone());
+        tx.insert(keyspace, data_key, data.clone());
     }
 
     Ok(())
