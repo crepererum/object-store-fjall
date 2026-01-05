@@ -349,8 +349,8 @@ impl ObjectStore for FjallStore {
                     let mut pos = 0usize;
                     let data_key_prefix = data_key_prefix(data_base);
                     for guard in tx.prefix(&keyspaces.data, data_key_prefix) {
-                        let v = match guard.into_inner() {
-                            Ok((_k, v)) => v,
+                        let v = match guard.value() {
+                            Ok(v) => v,
                             Err(e) => {
                                 sender.blocking_send(Err(e).generic_err()).ok();
                                 return;
@@ -437,6 +437,7 @@ impl ObjectStore for FjallStore {
             let tx = database.read_tx();
 
             for guard in tx.prefix(&keyspaces.head, head_key_prefix) {
+                // TODO: skip value loading for skipped entries
                 let (k, v) = match guard.into_inner() {
                     Ok((k, v)) => (k, v),
                     Err(e) => {
@@ -491,6 +492,7 @@ impl ObjectStore for FjallStore {
             let mut common_prefixes = BTreeSet::new();
             let mut objects = vec![];
             for guard in tx.prefix(&keyspaces.head, head_key_prefix) {
+                // TODO: skip value loading for skipped entries
                 let (k, v) = guard.into_inner().generic_err()?;
                 let path = path_from_head_key(&k)?;
 
@@ -659,7 +661,7 @@ fn clear_data(tx: &mut OptimisticWriteTx, keyspace: &OptimisticTxKeyspace, id: U
 
     let to_delete = tx
         .prefix(keyspace, data_key_prefix(data_base))
-        .map(|guard| guard.into_inner().map(|(k, _v)| k).generic_err())
+        .map(|guard| guard.key().generic_err())
         .collect::<Result<Vec<_>>>()?;
 
     for k in to_delete {
@@ -690,7 +692,7 @@ fn copy_data(
 
     let to_copy = tx
         .prefix(keyspace, data_key_prefix_from)
-        .map(|guard| guard.into_inner().map(|(_k, v)| v).generic_err())
+        .map(|guard| guard.value().generic_err())
         .collect::<Result<Vec<_>>>()?;
 
     for (idx, data) in to_copy.into_iter().enumerate() {
