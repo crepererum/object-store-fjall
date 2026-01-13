@@ -108,7 +108,7 @@ impl FjallStore {
     {
         let builder = OptimisticTxDatabase::builder(path)
             .manual_journal_persist(true)
-            .max_write_buffer_size(Some(128 * 1024 * 1024));
+            .journal_compression(fjall::CompressionType::None);
 
         let handles = spawn_blocking(move || {
             let database = builder.open().generic_err()?;
