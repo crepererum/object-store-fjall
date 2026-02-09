@@ -13,7 +13,7 @@ use clap::Parser;
 use futures::{StreamExt, TryStreamExt};
 use indicatif::ProgressIterator;
 use object_store::{DynObjectStore, ObjectStoreExt, PutPayload, path::Path as ObjectStorePath};
-use rand::{Rng, seq::IndexedRandom};
+use rand::{RngExt, seq::IndexedRandom};
 use serde::Serialize;
 use serde_with::{DurationSecondsWithFrac, serde_as};
 use uuid::Uuid;
