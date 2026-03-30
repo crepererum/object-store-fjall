@@ -509,7 +509,7 @@ impl ObjectStore for FjallStore {
                 };
 
                 if parts.next().is_some() {
-                    common_prefixes.insert(prefix.child(common_prefix));
+                    common_prefixes.insert(prefix.clone().join(common_prefix));
                 } else {
                     drop(parts);
                     objects.push(Head::from_slice(&v)?.object_meta(path));
