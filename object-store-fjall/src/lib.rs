@@ -8,9 +8,9 @@ use error::{GenericResultExt, string_err};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx, Readable, Slice};
 use futures::{Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{
-    CopyMode, CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    RenameTargetMode, Result, UpdateVersion, path::Path,
+    CopyMode, CopyOptions, Error, Extensions, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, RenameTargetMode, Result, UpdateVersion, path::Path,
 };
 use serialization::{Head, WrappedAttributes};
 use tokio::{sync::mpsc::Receiver, task::JoinSet};
@@ -284,6 +284,7 @@ impl ObjectStore for FjallStore {
         Ok(PutResult {
             e_tag: Some(id.to_string()),
             version: None,
+            extensions: Extensions::default(),
         })
     }
 
@@ -379,6 +380,7 @@ impl ObjectStore for FjallStore {
                 meta,
                 range,
                 attributes,
+                extensions: Extensions::default(),
             })
         })
         .await?
@@ -519,6 +521,7 @@ impl ObjectStore for FjallStore {
             Ok(ListResult {
                 objects,
                 common_prefixes: common_prefixes.into_iter().collect(),
+                extensions: Extensions::default(),
             })
         })
         .await?
